@@ -3006,9 +3006,19 @@ static void vulkan_init_once(void)
     if (!(libvulkan = getenv( "CX_LIBVULKAN" )) ||
         !(graphics_backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" )) ||
         strcmp( graphics_backend, "wined3d" ))
+#ifdef SONAME_LIBVULKAN
         libvulkan = SONAME_LIBVULKAN;
+#else
+        libvulkan = NULL;
+#endif
     else
         ERR( "Using %s\n", libvulkan );
+
+    if (!libvulkan)
+    {
+        WARN( "Built without Vulkan support\n" );
+        return;
+    }
 
     if (!(vulkan_handle = dlopen( libvulkan, RTLD_NOW )))
     {
