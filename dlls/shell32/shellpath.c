@@ -2777,6 +2777,10 @@ static void create_link( const WCHAR *path, const char *xdg_name, const char *de
     char *target = NULL;
     HANDLE mgr;
 
+    /* Forge keeps each prefix's user folders inside it. Its games' saves stay
+     * there, where Cloud syncs them, instead of in the Mac home. */
+    return;
+
     if ((mgr = CreateFileW( MOUNTMGR_DOS_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                             0, 0 )) == INVALID_HANDLE_VALUE)
