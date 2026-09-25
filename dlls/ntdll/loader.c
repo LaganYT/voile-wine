@@ -1148,6 +1148,18 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
     return proc;
 }
 
+static int use_lsteamclient(void)
+{
+    WCHAR env[32];
+    static int use = -1;
+
+    if (use != -1) return use;
+
+    use = !get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) || *env == '0';
+    if (!use)
+        ERR("lsteamclient disabled.\n");
+    return use;
+}
 
 /*************************************************************************
  *		import_dll
@@ -1184,6 +1196,17 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
         WARN( "Skipping unused import %s\n", name );
         *pwm = NULL;
         return TRUE;
+    }
+
+    if (use_lsteamclient())
+    {
+        if ((!strcmp(name, "tier0_s64.dll") || !strcmp(name, "vstdlib_s64.dll")) && wm->ldr.BaseDllName.Buffer
+            && (!wcscmp(wm->ldr.BaseDllName.Buffer, L"steamclient64.dll")
+                || !wcscmp(wm->ldr.BaseDllName.Buffer, L"gameoverlayrenderer64.dll")))
+        {
+            TRACE("%s -> ntdll.\n", name);
+            name = "ntdll.dll";
+        }
     }
 
     status = build_import_name( wm, buffer, name, len );
@@ -1710,7 +1733,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
 
     /* Skip calls for modules loaded with special load flags */
 
-    if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS) return STATUS_SUCCESS;
+    if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
     if (!entry) return STATUS_SUCCESS;
 
@@ -2283,12 +2306,17 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
                               DWORD flags, BOOL system, BOOL redirected, WINE_MODREF **pwm )
 {
     static const char builtin_signature[] = "Wine builtin DLL";
+    static HMODULE lsteamclient = NULL;
     char *signature = (char *)((IMAGE_DOS_HEADER *)*module + 1);
+    UNICODE_STRING lsteamclient_us;
     BOOL is_builtin;
     IMAGE_NT_HEADERS *nt;
     WINE_MODREF *wm;
     NTSTATUS status;
     SIZE_T map_size;
+    WCHAR *basename, *tmp;
+    ULONG basename_len;
+    BOOL is_steamclient32;
 
     if (!(nt = RtlImageNtHeader( *module ))) return STATUS_INVALID_IMAGE_FORMAT;
 
@@ -2309,6 +2337,56 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     wm->system = system;
 
     update_load_config( *module );
+
+    basename = nt_name->Buffer;
+    if ((tmp = wcsrchr(basename, '\\'))) basename = tmp + 1;
+    if ((tmp = wcsrchr(basename, '/'))) basename = tmp + 1;
+    basename_len = wcslen(basename);
+    if (basename_len >= 4 && !wcscmp(basename + basename_len - 4, L".dll")) basename_len -= 4;
+
+    if (use_lsteamclient() && ((is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE)) ||
+         !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient64", 13, TRUE) ||
+         !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer", 19, TRUE) ||
+         !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer64", 21, TRUE)) &&
+        RtlCreateUnicodeStringFromAsciiz(&lsteamclient_us, "lsteamclient.dll") &&
+        (lsteamclient || LdrLoadDll(load_path, 0, &lsteamclient_us, &lsteamclient) == STATUS_SUCCESS))
+    {
+        struct steamclient_setup_trampolines_params params = {.src_mod = *module, .tgt_mod = lsteamclient};
+        WINE_UNIX_CALL( unix_steamclient_setup_trampolines, &params );
+        NtFlushInstructionCache( NtCurrentProcess(), *module, map_size );
+        if (is_steamclient32)
+        {
+            OBJECT_ATTRIBUTES attr;
+            void *addr = *module;
+            SIZE_T size = 0x1000;
+            LARGE_INTEGER offset;
+            IO_STATUS_BLOCK io;
+            DWORD protect_old;
+            HANDLE file;
+
+            wm->ldr.Flags |= LDR_DONT_RESOLVE_REFS;
+            flags |= DONT_RESOLVE_DLL_REFERENCES;
+
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &protect_old );
+            memset( &attr, 0, sizeof(attr) );
+            attr.Length = sizeof(attr);
+            attr.Attributes = OBJ_CASE_INSENSITIVE;
+            attr.ObjectName = (UNICODE_STRING *)nt_name;
+            NtOpenFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io,
+                        FILE_SHARE_READ | FILE_SHARE_DELETE,
+                        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
+            offset.QuadPart = (ULONG_PTR)&nt->OptionalHeader.ImageBase - (ULONG_PTR)addr;
+            NtReadFile( file, 0, NULL, NULL, &io, &nt->OptionalHeader.ImageBase,
+                        sizeof(nt->OptionalHeader.ImageBase), &offset, NULL );
+            NtClose( file );
+            TRACE( "steamclient ImageBase %#Ix.\n", nt->OptionalHeader.ImageBase );
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, protect_old, &protect_old );
+        }
+        else
+        {
+            wm->ldr.Flags |= LDR_DONT_CALL_DLLMAIN;
+        }
+    }
 
     /* fixup imports */
 
@@ -2381,7 +2459,6 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     *module = NULL;
     return STATUS_SUCCESS;
 }
-
 
 /*************************************************************************
  *		build_ntdll_module
