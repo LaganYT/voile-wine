@@ -17,4 +17,4 @@ forge/import-crossover.sh 26.4.0          # commits it on crossover, tags crosso
 git rebase crossover-26.4.0 main          # replays Forge's changes, stopping at conflicts
 ```
 
-Then build the runtime from the new `main`, tag it `v26.4.0-1`, and update the pinned commit and the CrossOver archive hash in Forge's `wine-runtime/sources.json`. The import prints that hash.
+Then tag the new `main` `v26.4.0-1`. In [forge-runtime](https://github.com/Zagrios/forge-runtime), point the `wine` submodule at it, update the CrossOver archive in `sources.json` with the hash the import prints, and push a tag `v26.4.0-1` there to publish the runtime.
