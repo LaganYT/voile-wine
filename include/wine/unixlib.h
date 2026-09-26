@@ -36,6 +36,15 @@ typedef NTSTATUS (*unixlib_entry_t)( void *args );
 extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_funcs[];
 extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_wow64_funcs[];
 
+/* A Windows caller sets only the low bytes of a system call argument smaller
+ * than 32 bits, such as a BOOLEAN, and the syscall dispatcher copies the whole
+ * register or stack slot. Clang assumes the caller extended it, and so reads
+ * the stale bytes too: a FALSE restart flag could read as TRUE. Re-read the
+ * argument through memory, which keeps only its own bytes. This is a
+ * declaration, so it may come first in a function body. */
+#define SYSCALL_SMALL_ARG(arg) \
+    __attribute__((unused)) const int arg##_small_arg = (int)((arg) = *(volatile __typeof__(arg) *)&(arg))
+
 /* some useful private helpers from ntdll */
 
 #ifdef __WINESRC__

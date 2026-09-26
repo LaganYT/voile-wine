@@ -2858,6 +2858,8 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
                                       FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry,
                                       UNICODE_STRING *mask, BOOLEAN restart_scan )
 {
+    SYSCALL_SMALL_ARG( single_entry );
+    SYSCALL_SMALL_ARG( restart_scan );
     int cwd, fd, needs_close;
     enum server_fd_type type;
     struct dir_data *data;
@@ -6944,6 +6946,8 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
                             IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
                             LARGE_INTEGER *count, ULONG *key, BOOLEAN dont_wait, BOOLEAN exclusive )
 {
+    SYSCALL_SMALL_ARG( dont_wait );
+    SYSCALL_SMALL_ARG( exclusive );
     static int warn;
     unsigned int ret;
     HANDLE handle;
@@ -7116,6 +7120,7 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
                                              void *apc_context, IO_STATUS_BLOCK *iosb, void *buffer,
                                              ULONG buffer_size, ULONG filter, BOOLEAN subtree )
 {
+    SYSCALL_SMALL_ARG( subtree );
     struct async_fileio_read_changes *fileio;
     unsigned int status;
     ULONG size = max( 4096, buffer_size );
@@ -7622,6 +7627,8 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
                                BOOLEAN single_entry, void *list, ULONG list_len,
                                ULONG *index, BOOLEAN restart )
 {
+    SYSCALL_SMALL_ARG( single_entry );
+    SYSCALL_SMALL_ARG( restart );
     int fd, needs_close;
     NTSTATUS status;
 

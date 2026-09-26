@@ -950,6 +950,7 @@ ULONG_PTR WINAPI NtUserSetClassLongPtr( HWND hwnd, INT offset, LONG_PTR newval, 
  */
 WORD WINAPI NtUserSetClassWord( HWND hwnd, INT offset, WORD newval )
 {
+    SYSCALL_SMALL_ARG( newval );
     return set_class_long_size( hwnd, offset, newval, sizeof(WORD), TRUE );
 }
 

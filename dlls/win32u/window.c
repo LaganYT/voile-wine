@@ -1580,6 +1580,7 @@ LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval, BOO
  */
 BOOL WINAPI NtUserSetWindowFNID( HWND hwnd, WORD fnid )
 {
+    SYSCALL_SMALL_ARG( fnid );
     int off = FNID_OFF(fnid);
     int len = FNID_LEN(fnid);
     WND *win;
@@ -1629,6 +1630,7 @@ BOOL WINAPI NtUserSetWindowFNID( HWND hwnd, WORD fnid )
  */
 WORD WINAPI NtUserSetWindowWord( HWND hwnd, INT offset, WORD newval )
 {
+    SYSCALL_SMALL_ARG( newval );
     if (offset < 0 && offset != GWLP_USERDATA)
     {
         RtlSetLastWin32Error( ERROR_INVALID_INDEX );
@@ -2607,6 +2609,7 @@ BOOL WINAPI NtUserGetLayeredWindowAttributes( HWND hwnd, COLORREF *key, BYTE *al
  */
 BOOL WINAPI NtUserSetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
 {
+    SYSCALL_SMALL_ARG( alpha );
     BOOL ret;
 
     TRACE( "(%p,%s,%d,%x)\n", hwnd, debugstr_color(key), alpha, flags );

@@ -1089,6 +1089,7 @@ BOOL WINAPI NtUserSetKeyboardState( BYTE *state )
  */
 WORD WINAPI NtUserVkKeyScanEx( WCHAR chr, HKL layout )
 {
+    SYSCALL_SMALL_ARG( chr );
     const KBDTABLES *kbd_tables;
     SHORT ret;
 

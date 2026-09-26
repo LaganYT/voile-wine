@@ -508,6 +508,7 @@ static BOOL PALETTE_DeleteObject( HGDIOBJ handle )
  */
 HPALETTE WINAPI NtUserSelectPalette( HDC hdc, HPALETTE hpal, WORD bkg )
 {
+    SYSCALL_SMALL_ARG( bkg );
     BOOL is_primary = FALSE;
     HPALETTE ret = 0;
     DC *dc;
@@ -626,6 +627,8 @@ BOOL WINAPI NtGdiSetMagicColors( HDC hdc, DWORD magic, ULONG index )
 LONG WINAPI NtGdiDoPalette( HGDIOBJ handle, WORD start, WORD count, void *entries,
                             DWORD func, BOOL inbound )
 {
+    SYSCALL_SMALL_ARG( start );
+    SYSCALL_SMALL_ARG( count );
     switch (func)
     {
     case NtGdiAnimatePalette:
