@@ -38,5 +38,5 @@ $sha)."
 )
 
 echo "Imported CrossOver $version: $(cat "$work/tree/VERSION")"
-echo "Archive sha256, for Forge's sources.json: $sha"
+echo "Archive sha256, for Voile's sources.json: $sha"
 echo "Next: git rebase crossover-$version main, resolve conflicts, build, then tag v$version-1"

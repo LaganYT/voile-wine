@@ -15,6 +15,6 @@ if git rev-parse -q --verify "refs/tags/crossover-$version" >/dev/null; then
     echo "Up to date with CrossOver $version"
 else
     echo "CrossOver $version is available (last import: ${imported:-none})"
-    echo "Import it with: forge/import-crossover.sh $version"
+    echo "Import it with: voile/import-crossover.sh $version"
     exit 10
 fi
