@@ -1219,10 +1219,15 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
     struct syscall_frame *frame = get_syscall_frame();
     DWORD needed_flags = context->ContextFlags & ~CONTEXT_AMD64;
+    BOOL use_cached_debug_regs = FALSE;
     BOOL self = (handle == GetCurrentThread());
 
-    /* debug registers require a server call */
-    if (needed_flags & CONTEXT_DEBUG_REGISTERS) self = FALSE;
+    if (self && needed_flags & CONTEXT_DEBUG_REGISTERS)
+    {
+        /* debug registers require a server call if hw breakpoints are enabled */
+        if (amd64_thread_data()->dr7 & 0xff) self = FALSE;
+        else use_cached_debug_regs = TRUE;
+    }
 
     if (!self)
     {
@@ -1334,15 +1339,27 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
             frame->restore_flags |= CONTEXT_XSTATE;
         }
     }
-    /* update the cached version of the debug registers */
-    if (needed_flags & CONTEXT_DEBUG_REGISTERS)
+    if (context->ContextFlags & (CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64))
     {
-        amd64_thread_data()->dr0 = context->Dr0;
-        amd64_thread_data()->dr1 = context->Dr1;
-        amd64_thread_data()->dr2 = context->Dr2;
-        amd64_thread_data()->dr3 = context->Dr3;
-        amd64_thread_data()->dr6 = context->Dr6;
-        amd64_thread_data()->dr7 = context->Dr7;
+        if (use_cached_debug_regs)
+        {
+            context->Dr0 = amd64_thread_data()->dr0;
+            context->Dr1 = amd64_thread_data()->dr1;
+            context->Dr2 = amd64_thread_data()->dr2;
+            context->Dr3 = amd64_thread_data()->dr3;
+            context->Dr6 = amd64_thread_data()->dr6;
+            context->Dr7 = amd64_thread_data()->dr7;
+        }
+        else
+        {
+            /* update the cached version of the debug registers */
+            amd64_thread_data()->dr0 = context->Dr0;
+            amd64_thread_data()->dr1 = context->Dr1;
+            amd64_thread_data()->dr2 = context->Dr2;
+            amd64_thread_data()->dr3 = context->Dr3;
+            amd64_thread_data()->dr6 = context->Dr6;
+            amd64_thread_data()->dr7 = context->Dr7;
+        }
     }
     set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
     return STATUS_SUCCESS;
@@ -3125,7 +3142,19 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         *(XSAVE_FORMAT *)wow_context->ExtendedRegisters = context.FltSave;
     }
 
-    if (suspend) wait_suspend( &context );
+    if (suspend)
+    {
+        wait_suspend( &context );
+        if (context.ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64)
+        {
+            amd64_thread_data()->dr0 = context.Dr0;
+            amd64_thread_data()->dr1 = context.Dr1;
+            amd64_thread_data()->dr2 = context.Dr2;
+            amd64_thread_data()->dr3 = context.Dr3;
+            amd64_thread_data()->dr6 = context.Dr6;
+            amd64_thread_data()->dr7 = context.Dr7;
+        }
+    }
 
     ctx = (CONTEXT *)((ULONG_PTR)context.Rsp & ~15) - 1;
     *ctx = context;
