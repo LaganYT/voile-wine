@@ -25,6 +25,8 @@
 #include "config.h"
 
 #include <stdarg.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -311,6 +313,35 @@ static unsigned int update_if_table( void )
 {
     struct if_nameindex *indices = if_nameindex(), *entry;
     unsigned int append_count = 0;
+
+    /* if_nameindex() fails (NULL) when the kernel has no AF_NETLINK (glibc builds the list from netlink); the
+     * NULL dereference used to kill the calling thread with if_list_lock held, and every later caller (for
+     * example gethostbyname() of the own host name) blocked forever. */
+    if (!indices)
+    {
+        /* fallback without netlink: SIOCGIFCONF lists the configured interfaces, SIOCGIFINDEX gives their index */
+        struct ifconf ifc;
+        struct ifreq reqs[32];
+        int fd, i;
+
+        WARN( "if_nameindex failed: %s, trying SIOCGIFCONF\n", strerror( errno ));
+        if ((fd = socket( PF_INET, SOCK_DGRAM, 0 )) == -1) return 0;
+        ifc.ifc_len = sizeof(reqs);
+        ifc.ifc_req = reqs;
+        if (!ioctl( fd, SIOCGIFCONF, &ifc ))
+        {
+            for (i = 0; i < ifc.ifc_len / sizeof(reqs[0]); i++)
+            {
+                struct ifreq req = reqs[i];
+                if (ioctl( fd, SIOCGIFINDEX, &req ) || !req.ifr_ifindex) continue;
+                if (!find_entry_from_index( req.ifr_ifindex ) && add_entry( req.ifr_ifindex, req.ifr_name ))
+                    ++append_count;
+            }
+        }
+        else WARN( "SIOCGIFCONF failed: %s\n", strerror( errno ));
+        close( fd );
+        return append_count;
+    }
 
     for (entry = indices; entry->if_index; entry++)
     {
