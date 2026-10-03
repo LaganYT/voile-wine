@@ -680,10 +680,10 @@ static UINT SAIL_UpdateDisplayDevices( const struct gdi_device_manager *manager,
     manager->add_source( "wsd", DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
                          NtUserGetSystemDpiForProcess( NULL ), param );
     SetRect( &monitor.rc_monitor, 0, 0, width, height );
+    /* The whole screen, not wsd's work area: Rocket League places its borderless window from the work area (at y 60
+     * under a 30 px menu bar), which then no longer covers the screen and is not fullscreen. AppKit keeps a title
+     * bar below the menu bar by itself (WSD_EV_FRAME). */
     monitor.rc_work = monitor.rc_monitor;
-    if (hello.work_width && hello.work_height)  /* without the menu bar and the Dock */
-        SetRect( &monitor.rc_work, hello.work_x, hello.work_y, hello.work_x + hello.work_width,
-                 hello.work_y + hello.work_height );
     manager->add_monitor( &monitor, param );
 
     current.dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
