@@ -1373,7 +1373,10 @@ struct mapping *create_session_mapping( struct object *root, const struct unicod
     static const unsigned int access = FILE_READ_DATA | FILE_WRITE_DATA;
     size_t size = max( sizeof(*shared_session) + sizeof(object_shm_t) * 512, 0x10000 );
 
-    size = round_size( size, host_page_mask );
+    /* SailOver: the session mapping is mapped MAP_SHARED by every client; keep its size and every growth step a
+     * multiple of the 64 KiB allocation granularity so that no view of it ends inside a larger (16 KiB) host page
+     * shared with a private allocation. */
+    size = round_size( size, 0xffff );
     return create_mapping( root, name, attr, size, SEC_COMMIT, 0, access, sd );
 }
 
@@ -1409,7 +1412,7 @@ static struct session_block *grow_session_mapping( mem_size_t needed )
     void *tmp;
 
     new_size = max( old_size * 3 / 2, old_size + max( needed, 0x10000 ) );
-    new_size = round_size( new_size, host_page_mask );
+    new_size = round_size( new_size, 0xffff );  /* SailOver: see create_session_mapping */
     assert( new_size > old_size );
 
     unix_fd = get_unix_fd( session_mapping->fd );
