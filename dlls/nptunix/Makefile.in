@@ -1,0 +1,12 @@
+# nptunix: Wine unixlib bridge of the Neptune D3D11/DXGI client (mesa src/virtio/neptune/nptunix, MIT), with
+# presentation through the SailOver window server wsd instead of X11 DRI3/Present. See NOTES.md (M5).
+MODULE = nptunix.dll
+UNIXLIB = nptunix.so
+UNIX_LIBS = $(PTHREAD_LIBS)
+
+SOURCES = \
+	npt_display_wsd.c \
+	npt_unix.c \
+	npt_unix_virtgpu_none.c \
+	npt_unix_wsi_wsd.c \
+	nptunix_pe.c
