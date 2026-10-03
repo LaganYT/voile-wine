@@ -1262,6 +1262,14 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
                                   (void **)&stat, sizeof(*stat), count, 0 );
     if (err) return err;
 
+    /* No interface at all: Windows returns ERROR_NO_DATA. The code below would walk an empty adapter array
+     * (it crashed in address_lists_iterate when the host exposes no interface, e.g. without netlink). */
+    if (!*count)
+    {
+        NsiFreeTable( luids, rw, dyn, stat );
+        return ERROR_NO_DATA;
+    }
+
     needed = *count * (sizeof(*aa) + ((CHARS_IN_GUID + 1) & ~1) + sizeof(stat->descr.String));
     needed += *count * sizeof(rw->alias.String); /* GAA_FLAG_SKIP_FRIENDLY_NAME is ignored */
 
