@@ -2953,9 +2953,10 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
  * Find a file in a directory the hard way, by doing a case-insensitive search.
  * The file found is appended to unix_name at pos.
  * There must be at least MAX_DIR_ENTRY_LEN+2 chars available at pos.
+ * dir_case caches the case sensitivity of the directory (-1: not known yet) between calls on the same directory.
  */
 static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
-                                  BOOLEAN check_case )
+                                  BOOLEAN check_case, int *dir_case )
 {
     WCHAR buffer[MAX_DIR_ENTRY_LEN];
     BOOLEAN is_name_8_dot_3;
@@ -2987,8 +2988,11 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 
     /* A case-insensitive directory finds every name by itself, except the hashed short names Wine makes up
      * (XXXX~YYY.EXT): other 8.3 names do not need the listing either. */
-    if (!(is_name_8_dot_3 && length >= 8 && name[4] == '~') && !get_dir_case_sensitivity( root_fd, unix_name ))
-        goto not_found;
+    if (!(is_name_8_dot_3 && length >= 8 && name[4] == '~'))
+    {
+        if (*dir_case == -1) *dir_case = get_dir_case_sensitivity( root_fd, unix_name );
+        if (!*dir_case) goto not_found;
+    }
 
     /* now look for it through the directory */
 
@@ -3609,6 +3613,7 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     {
         const WCHAR *end, *next;
         WCHAR *reparse_name;
+        int dir_case = -1;  /* the reparse point lookup below asks about the same directory */
 
         end = name;
         while (end < name + name_len && *end != '\\') end++;
@@ -3626,7 +3631,7 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             unix_name = *buffer = new_name;
         }
 
-        status = find_file_in_dir( root_fd, unix_name, pos, name, end - name, is_unix );
+        status = find_file_in_dir( root_fd, unix_name, pos, name, end - name, is_unix, &dir_case );
 
         /* try to resolve it as a reparse point */
         if (status == STATUS_OBJECT_NAME_NOT_FOUND && (reparse_name = malloc( (end - name + 1) * sizeof(WCHAR) )))
@@ -3638,11 +3643,11 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
 
             if (!name_len && open_reparse)
             {
-                status = find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix );
+                status = find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix, &dir_case );
             }
             else
             {
-                if (!find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix )
+                if (!find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix, &dir_case )
                     && (reparse_fd = openat( root_fd, unix_name, O_RDONLY )) >= 0)
                 {
                     status = resolve_reparse_point( reparse_fd, root_fd, attr, nt_name, nt_pos, next - name, buffer,
