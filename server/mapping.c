@@ -275,6 +275,12 @@ static void unlink_temp_file( char *name );
 void init_memory(void)
 {
     host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
+    {
+        /* SailOver: same override as ntdll's virtual.c, for hosts whose hardware page is larger than the guest's */
+        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
+        size_t size = env ? strtoul( env, NULL, 0 ) : 0;
+        if (size > host_page_mask + 1 && size <= 0x10000 && !(size & (size - 1))) host_page_mask = size - 1;
+    }
     free_map_addr( 0x60000000, 0x1c000000 );
     free_map_addr( 0x600000000000, 0x100000000000 );
 }

@@ -174,7 +174,14 @@ static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
 static const UINT_PTR granularity_mask = 0xffff;
 
-#ifdef __aarch64__
+/* SailOver: an x86-64 Linux guest under FEXCore/LKD sees 4 KiB pages, but the hardware page is 16 KiB and its
+ * protection is the union of its 4 KiB pages. WINE_HOST_PAGE_SIZE=16384 makes Wine use its large host page code
+ * (written for 16 KiB arm64 kernels) for guard pages, stacks, write watches and file mappings. */
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
+#define WINE_VARIABLE_HOST_PAGE
+#endif
+
+#ifdef WINE_VARIABLE_HOST_PAGE
 static UINT_PTR host_page_size;
 static UINT_PTR host_page_mask;
 #else
@@ -2358,8 +2365,10 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     else
     {
         /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
-         * but they are on Linux so we take advantage of it */
-#ifdef __linux__
+         * but they are on Linux so we take advantage of it.
+         * SailOver: not under LKD (Linux syscalls served on macOS), where a read-only MAP_PRIVATE file mapping is a
+         * snapshot; shared session/queue objects written by wineserver would go stale. Use the portable path. */
+#if defined(__linux__) && !defined(WINE_VARIABLE_HOST_PAGE)
         flags |= MAP_PRIVATE;
 #else
         flags |= MAP_SHARED;
@@ -3655,8 +3664,13 @@ void virtual_init(void)
     pthread_mutex_init( &virtual_mutex, &attr );
     pthread_mutexattr_destroy( &attr );
 
-#ifdef __aarch64__
+#ifdef WINE_VARIABLE_HOST_PAGE
     host_page_size = sysconf( _SC_PAGESIZE );
+    {
+        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
+        UINT_PTR size = env ? strtoul( env, NULL, 0 ) : 0;
+        if (size > host_page_size && size <= 0x10000 && !(size & (size - 1))) host_page_size = size;
+    }
     host_page_mask = host_page_size - 1;
     TRACE( "host page size: %uk\n", (UINT)host_page_size / 1024 );
 #endif
