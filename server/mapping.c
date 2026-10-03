@@ -663,7 +663,9 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
         {
             get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
             if (file_size > max_size) max_size = file_size;
-            total_size += map_size;
+            /* SailOver: each shared section sits in the temp file at its own RVA (sparse file), so that file offset
+             * and address are congruent modulo any host page size (16 KiB hosts cannot mmap them otherwise) */
+            total_size = max( total_size, (mem_size_t)sec[i].VirtualAddress + map_size );
         }
     }
     if (!total_size) return 1;  /* nothing to do */
@@ -685,7 +687,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED)) continue;
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
         get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
-        write_pos = shared_pos;
+        write_pos = sec[i].VirtualAddress;  /* SailOver: see above */
         shared_pos += map_size;
         if (!sec[i].PointerToRawData || !file_size) continue;
         toread = file_size;

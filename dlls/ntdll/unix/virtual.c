@@ -3135,6 +3135,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
             (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
         {
+            pos = sec[i].VirtualAddress;  /* SailOver: the server stores each shared section at its RVA */
             TRACE_(module)( "%s mapping shared section %.8s at %p off %x (%x) size %lx (%lx) flags %x\n",
                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
