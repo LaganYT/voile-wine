@@ -2790,6 +2790,27 @@ static void *get_host_addr_space_limit(void)
         else if (errno == EEXIST) break;
         addr >>= 1;
     }
+#ifdef __linux__
+    /* SailOver: the limit is not always a power of two (an emulated address space ends at 0x7ffffe000000, for
+     * instance): find it to 64 KiB within [addr, addr * 2) instead of letting allocations retry above it. */
+    {
+        UINT_PTR lo = addr, hi = addr << 1;
+        while (hi - lo > granularity_mask + 1)
+        {
+            UINT_PTR mid = ((lo + hi) / 2) & ~granularity_mask;
+            void *ret = mmap( (void *)mid, host_page_size, PROT_NONE, flags, -1, 0 );
+            BOOL ok = FALSE;
+            if (ret != MAP_FAILED)
+            {
+                munmap( ret, host_page_size );
+                ok = (ret == (void *)mid);
+            }
+            else if (errno == EEXIST) ok = TRUE;
+            if (ok) lo = mid; else hi = mid;
+        }
+        if (hi != addr << 1) return (void *)(hi - (granularity_mask + 1));
+    }
+#endif
     return (void *)((addr << 1) - (granularity_mask + 1));
 }
 
