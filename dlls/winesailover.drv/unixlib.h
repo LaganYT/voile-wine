@@ -25,7 +25,15 @@ enum sailoverdrv_unix_func
 {
     sailoverdrv_unix_func_init,
     sailoverdrv_unix_func_read_events,
+    sailoverdrv_unix_func_set_app_icon,
     sailoverdrv_unix_func_count,
+};
+
+/* sailoverdrv_unix_func_set_app_icon */
+struct sailoverdrv_app_icon_params
+{
+    UINT        width, height;
+    const void *bits;  /* top-down BGRA, straight alpha, width * 4 bytes per row */
 };
 
 #endif

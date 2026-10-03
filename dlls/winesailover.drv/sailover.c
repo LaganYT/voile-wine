@@ -1,10 +1,12 @@
 /*
  * winesailover.drv unix side: user driver backed by the SailOver window server wsd
  *
- * One AF_UNIX connection per process. Top-level visible windows get a borderless wsd window (Wine draws
- * the non-client area itself); their window surface is copied into a shared memory buffer (memfd sent
- * with SCM_RIGHTS) and presented. A Win32 thread created by the PE side reads the wsd events and
- * injects keyboard and mouse input with NtUserSendHardwareInput.
+ * One AF_UNIX connection per process. Top-level visible windows get a wsd window: a macOS titled window
+ * (title bar and buttons drawn by macOS, like winemac.drv) when the Win32 window has a caption, a borderless
+ * one otherwise (Wine draws any frame itself). Their window surface is copied into a shared memory buffer
+ * (memfd sent with SCM_RIGHTS) and presented. A Win32 thread created by the PE side reads the wsd events and
+ * injects keyboard and mouse input with NtUserSendHardwareInput; moves, resizes and minimizes made by the user
+ * on the macOS window are applied to the Win32 window by its own thread (a posted driver message).
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -72,13 +74,21 @@ struct sail_win
     BOOL  created;   /* wsd window exists */
     BOOL  shown;
     BOOL  fullscreen;
+    BOOL  minimized; /* in the Dock */
     BOOL  external;  /* a D3D swapchain (nptunix) presents into this window, GDI flushes are not shown */
+    UINT  style;     /* WSD_STYLE_* frame of the wsd window */
     UINT  width, height;
     int   x, y;      /* last position sent to wsd */
+    RECT  window;    /* window rect in screen coordinates */
     RECT  visible;   /* visible rect in screen coordinates */
     RECT  client;    /* client rect relative to the visible rect (window pixels) */
+    BOOL  frame_pending;
+    RECT  pending;   /* visible rect the user gave the macOS window, applied by the window's thread */
     struct sail_buffer buffers[NB_BUFFERS];
 };
+
+/* driver messages, handled by SAIL_WindowMessage in the window's thread */
+enum { WM_SAIL_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG };
 
 static int wsd_fd = -1;
 static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -254,6 +264,19 @@ static BOOL is_toplevel( HWND hwnd )
     return hwnd != NtUserGetDesktopWindow() && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow();
 }
 
+/* The wsd frame of a Win32 window: a window with a caption gets the macOS title bar and the buttons its system
+ * menu, minimize box and sizing border ask for (the same rule as winemac.drv); any other one is borderless. */
+static UINT frame_style( UINT style, UINT ex_style )
+{
+    UINT ret = WSD_STYLE_TITLED;
+
+    if ((style & WS_CAPTION) != WS_CAPTION || (ex_style & WS_EX_LAYERED)) return WSD_STYLE_BORDERLESS;
+    if (style & WS_SYSMENU) ret |= WSD_STYLE_CLOSABLE;
+    if (style & WS_MINIMIZEBOX) ret |= WSD_STYLE_MINIATURIZABLE;
+    if (style & WS_THICKFRAME) ret |= WSD_STYLE_RESIZABLE;
+    return ret;
+}
+
 /* creates a shared memory buffer and attaches it in wsd */
 static BOOL alloc_buffer( struct sail_buffer *buf, UINT width, UINT height )
 {
@@ -322,7 +345,7 @@ static BOOL sail_surface_flush( struct window_surface *surface, const RECT *rect
 
     pthread_mutex_lock( &win_lock );
     if (!(win = get_win( surface->hwnd )) || !win->created) goto done;  /* stays dirty until shown */
-    if (win->external) { ret = TRUE; goto done; }
+    if (win->external || win->minimized) { ret = TRUE; goto done; }  /* nothing to show */
 
     /* The surface is usually larger than the window (Wine rounds it up); present exactly the visible window:
      * rect is the surface position relative to the visible rect, so the window starts at (-left, -top). */
@@ -407,13 +430,24 @@ static BOOL SAIL_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, cons
     return is_toplevel( hwnd );  /* top-level windows get a driver surface */
 }
 
+/* The caption and borders macOS draws for a titled window: win32u leaves them out of the visible rect. */
+static BOOL SAIL_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask )
+{
+    if (!(frame_style( style, ex_style ) & WSD_STYLE_TITLED)) return FALSE;
+    *style_mask = WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
+    *ex_style_mask = WS_EX_TOOLWINDOW | WS_EX_DLGMODALFRAME;
+    return TRUE;
+}
+
 static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                    const struct window_rects *rects, struct window_surface *surface )
 {
-    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE ), ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     BOOL visible = (style & WS_VISIBLE) && !(style & WS_MINIMIZE) && !IsRectEmpty( &rects->visible );
+    BOOL minimized = (style & WS_VISIBLE) && (style & WS_MINIMIZE);
     BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
     UINT width = rects->visible.right - rects->visible.left, height = rects->visible.bottom - rects->visible.top;
+    UINT frame = frame_style( style, ex_style );
     struct sail_win *win;
 
     if (!is_toplevel( hwnd )) return;
@@ -425,6 +459,25 @@ static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     {
         if (!visible || !(win = alloc_win( hwnd ))) goto done;
     }
+    if (minimized && win->created && win->shown && (win->style & WSD_STYLE_MINIATURIZABLE))
+    {
+        /* into the Dock; Wine's minimized position (off screen) is not given to wsd */
+        if (!win->minimized)
+            wsd_send( WSD_WINDOW_MINIMIZE, &(struct wsd_window_flag){ win_id( win ), 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        win->minimized = TRUE;
+        goto done;
+    }
+    if (win->minimized && !minimized)
+    {
+        wsd_send( WSD_WINDOW_MINIMIZE, &(struct wsd_window_flag){ win_id( win ), 0 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        win->minimized = FALSE;
+    }
+    if (win->created && frame != win->style)
+    {
+        wsd_send( WSD_WINDOW_SET_STYLE, &(struct wsd_window_flag){ win_id( win ), frame }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        win->style = frame;
+    }
+    win->window = rects->window;
     win->visible = rects->visible;
     win->client = rects->client;
     OffsetRect( &win->client, -rects->visible.left, -rects->visible.top );
@@ -448,16 +501,17 @@ static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     }
     if (visible && !win->created)
     {
-        struct wsd_window_create create = { win_id( win ), width, height, WSD_STYLE_BORDERLESS };
+        struct wsd_window_create create = { win_id( win ), width, height, frame };
         WCHAR textW[256];
         char title[256 * 3];
         DWORD len = 0;
         INT n = NtUserInternalGetWindowText( hwnd, textW, ARRAY_SIZE(textW) );
 
         if (n > 0) RtlUnicodeToUTF8N( title, sizeof(title), &len, textW, n * sizeof(WCHAR) );
-        if (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOPMOST) create.style |= WSD_STYLE_TOPMOST;
+        if (ex_style & WS_EX_TOPMOST) create.style |= WSD_STYLE_TOPMOST;
         if (!wsd_send( WSD_WINDOW_CREATE, &create, sizeof(create), title, len, -1 )) goto done;
         win->created = TRUE;
+        win->style = frame;
         /* nptunix (Neptune D3D presentation) finds the wsd window of a HWND through this property */
         NtUserSetProp( hwnd, sailover_window_propW, ULongToHandle( win_id( win ) ));
         win->width = width;
@@ -481,6 +535,51 @@ static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     }
 done:
     pthread_mutex_unlock( &win_lock );
+}
+
+/* Applies in the window's thread the frame the user gave the macOS window (WSD_EV_FRAME). */
+static void apply_frame( HWND hwnd )
+{
+    UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    struct sail_win *win;
+    RECT rect;
+
+    pthread_mutex_lock( &win_lock );
+    if (!(win = get_win( hwnd )) || !win->frame_pending || win->minimized || win->fullscreen)
+    {
+        if (win) win->frame_pending = FALSE;
+        pthread_mutex_unlock( &win_lock );
+        return;
+    }
+    win->frame_pending = FALSE;
+    /* the window rect around the new visible rect, with the same non-client margins */
+    rect.left   = win->pending.left - (win->visible.left - win->window.left);
+    rect.top    = win->pending.top - (win->visible.top - win->window.top);
+    rect.right  = win->pending.right + (win->window.right - win->visible.right);
+    rect.bottom = win->pending.bottom + (win->window.bottom - win->visible.bottom);
+    if (rect.right - rect.left == win->window.right - win->window.left &&
+        rect.bottom - rect.top == win->window.bottom - win->window.top) flags |= SWP_NOSIZE;
+    /* wsd already shows this frame: WindowPosChanged must not send it back */
+    win->x = win->pending.left;
+    win->y = win->pending.top;
+    win->width = win->pending.right - win->pending.left;
+    win->height = win->pending.bottom - win->pending.top;
+    pthread_mutex_unlock( &win_lock );
+
+    TRACE( "hwnd %p moved by the user to %s\n", hwnd, wine_dbgstr_rect( &rect ));
+    NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags );
+}
+
+static LRESULT SAIL_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    switch (msg)
+    {
+    case WM_SAIL_APPLY_FRAME:
+        apply_frame( hwnd );
+        return 0;
+    }
+    FIXME( "unknown driver message %#x hwnd %p\n", msg, hwnd );
+    return 0;
 }
 
 static void SAIL_DestroyWindow( HWND hwnd )
@@ -582,6 +681,9 @@ static UINT SAIL_UpdateDisplayDevices( const struct gdi_device_manager *manager,
                          NtUserGetSystemDpiForProcess( NULL ), param );
     SetRect( &monitor.rc_monitor, 0, 0, width, height );
     monitor.rc_work = monitor.rc_monitor;
+    if (hello.work_width && hello.work_height)  /* without the menu bar and the Dock */
+        SetRect( &monitor.rc_work, hello.work_x, hello.work_y, hello.work_x + hello.work_width,
+                 hello.work_y + hello.work_height );
     manager->add_monitor( &monitor, param );
 
     current.dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
@@ -761,6 +863,43 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     case WSD_EV_CLOSE:
         if (hwnd) NtUserPostMessage( hwnd, WM_SYSCOMMAND, SC_CLOSE, 0 );
         break;
+    case WSD_EV_FRAME:
+    {
+        const struct wsd_window_frame *ev = (const void *)payload;
+        BOOL post = FALSE;
+        pthread_mutex_lock( &win_lock );
+        if ((win = get_win_by_id( ev->window_id )) && win->hwnd == hwnd)
+        {
+            SetRect( &win->pending, ev->x, ev->y, ev->x + (int)ev->width, ev->y + (int)ev->height );
+            post = !win->frame_pending;  /* one message for a burst of moves */
+            win->frame_pending = TRUE;
+        }
+        pthread_mutex_unlock( &win_lock );
+        if (hwnd && post) NtUserPostMessage( hwnd, WM_SAIL_APPLY_FRAME, 0, 0 );
+        break;
+    }
+    case WSD_EV_MINIMIZE:
+    {
+        const struct wsd_window_flag *ev = (const void *)payload;
+        BOOL changed = FALSE;
+        pthread_mutex_lock( &win_lock );
+        if ((win = get_win_by_id( ev->window_id )) && win->hwnd == hwnd && win->minimized != !!ev->value)
+        {
+            win->minimized = !!ev->value;
+            changed = TRUE;
+        }
+        pthread_mutex_unlock( &win_lock );
+        TRACE( "hwnd %p minimized %u by the user (changed %u)\n", hwnd, ev->value, changed );
+        if (hwnd && changed) NtUserPostMessage( hwnd, WM_SYSCOMMAND, ev->value ? SC_MINIMIZE : SC_RESTORE, 0 );
+        break;
+    }
+    case WSD_EV_ZOOM:
+    {
+        DWORD style = hwnd ? NtUserGetWindowLongW( hwnd, GWL_STYLE ) : 0;
+        if (style & WS_MAXIMIZEBOX)
+            NtUserPostMessage( hwnd, WM_SYSCOMMAND, (style & WS_MAXIMIZE) ? SC_RESTORE : SC_MAXIMIZE, 0 );
+        break;
+    }
     case WSD_EV_RESIZE:
     {
         const struct wsd_ev_resize *ev = (const void *)payload;
@@ -849,9 +988,11 @@ static const struct user_driver_funcs sailoverdrv_funcs =
     .pClipCursor = SAIL_ClipCursor,
     .pCreateWindowSurface = SAIL_CreateWindowSurface,
     .pDestroyWindow = SAIL_DestroyWindow,
+    .pGetWindowStyleMasks = SAIL_GetWindowStyleMasks,
     .pSetCursor = SAIL_SetCursor,
     .pSetWindowText = SAIL_SetWindowText,
     .pUpdateDisplayDevices = SAIL_UpdateDisplayDevices,
+    .pWindowMessage = SAIL_WindowMessage,
     .pWindowPosChanged = SAIL_WindowPosChanged,
     .pWindowPosChanging = SAIL_WindowPosChanging,
 };
@@ -901,10 +1042,40 @@ static NTSTATUS sailoverdrv_read_events( void *arg )
     return STATUS_UNSUCCESSFUL;
 }
 
+/* the program's icon becomes the Dock and Cmd-Tab icon */
+static NTSTATUS sailoverdrv_set_app_icon( void *arg )
+{
+    const struct sailoverdrv_app_icon_params *params = arg;
+    struct wsd_app_icon icon = { params->width, params->height, params->width * 4 };
+    size_t size = (size_t)icon.stride * icon.height;
+    size_t map_size = (size + SHM_ALIGN - 1) & ~(size_t)(SHM_ALIGN - 1);
+    void *bits;
+    BOOL ret;
+    int fd;
+
+    if (!params->width || !params->height || params->width > 1024 || params->height > 1024)
+        return STATUS_INVALID_PARAMETER;
+    if ((fd = syscall( __NR_memfd_create, "wsd-icon", 1 /* MFD_CLOEXEC */ )) < 0) return STATUS_UNSUCCESSFUL;
+    if (ftruncate( fd, map_size ) < 0 ||
+        (bits = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+    {
+        close( fd );
+        return STATUS_UNSUCCESSFUL;
+    }
+    memcpy( bits, params->bits, size );
+    munmap( bits, map_size );
+    icon.size = size;
+    ret = wsd_send( WSD_APP_ICON, &icon, sizeof(icon), NULL, 0, fd );
+    close( fd );
+    TRACE( "icon %ux%u -> %d\n", params->width, params->height, ret );
+    return ret ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     sailoverdrv_init,
     sailoverdrv_read_events,
+    sailoverdrv_set_app_icon,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == sailoverdrv_unix_func_count );
