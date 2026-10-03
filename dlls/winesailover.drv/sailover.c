@@ -1,0 +1,910 @@
+/*
+ * winesailover.drv unix side: user driver backed by the SailOver window server wsd
+ *
+ * One AF_UNIX connection per process. Top-level visible windows get a borderless wsd window (Wine draws
+ * the non-client area itself); their window surface is copied into a shared memory buffer (memfd sent
+ * with SCM_RIGHTS) and presented. A Win32 thread created by the PE side reads the wsd events and
+ * injects keyboard and mouse input with NtUserSendHardwareInput.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include "config.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <poll.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "ntgdi.h"
+#include "ntuser.h"
+#include "wine/gdi_driver.h"
+#include "wine/debug.h"
+#include "unixlib.h"
+#include "wsd_protocol.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(sailover);
+
+#define SHM_ALIGN      0x4000  /* host page; wsd maps the whole fd */
+#define STRIDE_ALIGN   256     /* multiple of every Metal linear texture alignment */
+#define NB_BUFFERS     2
+
+struct sail_buffer
+{
+    UINT  id;        /* wsd buffer id, 0 when unused */
+    void *bits;
+    size_t map_size;
+    UINT  width, height, stride;
+    BOOL  busy;      /* presented, no EV_RELEASE yet */
+};
+
+struct sail_win
+{
+    HWND  hwnd;      /* 0 when the slot is free */
+    BOOL  created;   /* wsd window exists */
+    BOOL  shown;
+    BOOL  fullscreen;
+    BOOL  external;  /* a D3D swapchain (nptunix) presents into this window, GDI flushes are not shown */
+    UINT  width, height;
+    int   x, y;      /* last position sent to wsd */
+    RECT  visible;   /* visible rect in screen coordinates */
+    RECT  client;    /* client rect relative to the visible rect (window pixels) */
+    struct sail_buffer buffers[NB_BUFFERS];
+};
+
+static int wsd_fd = -1;
+static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t win_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sail_win windows[WSD_MAX_WINDOWS];
+static UINT next_buffer_id = 1;
+static UINT64 present_serial;
+static struct wsd_hello_reply hello;
+static BOOL cursor_visible = TRUE;
+static const WCHAR sailover_window_propW[] = {'_','_','w','i','n','e','_','s','a','i','l','o','v','e','r','_','w','i','n','d','o','w',0};
+static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
+static void (*presented_listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns );
+static BOOL debug_injected;
+static BOOL wsd_send( UINT type, const void *payload, UINT len, const void *extra, UINT extra_len, int fd );
+static UINT relative_window;  /* wsd window in relative mouse mode, 0 when none */
+static BOOL clip_active;
+
+/* Relative (raw delta) mouse while the game hides the cursor and confines it to its window, like a captured mouse
+ * on Windows; absolute otherwise. */
+static void update_relative_mouse( UINT window_id )
+{
+    UINT want = (!cursor_visible && clip_active) ? window_id : 0;
+    if (want == relative_window) return;
+    if (relative_window)
+        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ relative_window, 0 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    if (want)
+        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ want, 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    TRACE( "relative mouse window %u -> %u\n", relative_window, want );
+    relative_window = want;
+}  /* WINE_SAILOVER_DEBUG_INJECT already sent */
+
+static BOOL latency_trace;
+
+static UINT64 now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/***********************************************************************
+ *           protocol helpers
+ */
+static BOOL write_all( const void *data, size_t size, int fd_to_send )
+{
+    const char *ptr = data;
+    BOOL first = TRUE;
+
+    while (size)
+    {
+        struct iovec iov = { (void *)ptr, size };
+        char control[CMSG_SPACE(sizeof(int))];
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+        ssize_t ret;
+
+        if (first && fd_to_send != -1)
+        {
+            struct cmsghdr *cmsg;
+            memset( control, 0, sizeof(control) );
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof(control);
+            cmsg = CMSG_FIRSTHDR( &msg );
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy( CMSG_DATA(cmsg), &fd_to_send, sizeof(int) );
+        }
+        ret = sendmsg( wsd_fd, &msg, MSG_NOSIGNAL );
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;
+            WARN( "sendmsg failed: %s\n", strerror(errno) );
+            return FALSE;
+        }
+        first = FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+static BOOL wsd_send( UINT type, const void *payload, UINT len, const void *extra, UINT extra_len, int fd )
+{
+    char buf[sizeof(struct wsd_hdr) + WSD_MAX_PAYLOAD];
+    struct wsd_hdr *hdr = (struct wsd_hdr *)buf;
+    BOOL ret;
+
+    if (wsd_fd == -1 || len + extra_len > WSD_MAX_PAYLOAD) return FALSE;
+    hdr->type = type;
+    hdr->len = len + extra_len;
+    if (len) memcpy( hdr + 1, payload, len );
+    if (extra_len) memcpy( (char *)(hdr + 1) + len, extra, extra_len );
+    pthread_mutex_lock( &write_lock );
+    ret = write_all( buf, sizeof(*hdr) + len + extra_len, fd );
+    pthread_mutex_unlock( &write_lock );
+    TRACE( "request %u len %u fd %d -> %d\n", type, len + extra_len, fd, ret );
+    return ret;
+}
+
+static BOOL read_all( void *data, size_t size )
+{
+    char *ptr = data;
+    while (size)
+    {
+        ssize_t ret = read( wsd_fd, ptr, size );
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret <= 0) return FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+/* reads one message; payload must hold WSD_MAX_PAYLOAD bytes */
+static BOOL wsd_read( struct wsd_hdr *hdr, void *payload )
+{
+    if (!read_all( hdr, sizeof(*hdr) )) return FALSE;
+    if (hdr->len > WSD_MAX_PAYLOAD) return FALSE;
+    return read_all( payload, hdr->len );
+}
+
+/***********************************************************************
+ *           window table (win_lock held)
+ */
+static struct sail_win *get_win( HWND hwnd )
+{
+    UINT i;
+    for (i = 0; i < WSD_MAX_WINDOWS; i++) if (windows[i].hwnd == hwnd) return &windows[i];
+    return NULL;
+}
+
+static struct sail_win *get_win_by_id( UINT id )
+{
+    if (!id || id > WSD_MAX_WINDOWS || !windows[id - 1].hwnd) return NULL;
+    return &windows[id - 1];
+}
+
+static UINT win_id( struct sail_win *win ) { return win - windows + 1; }
+
+static struct sail_win *alloc_win( HWND hwnd )
+{
+    UINT i;
+    for (i = 0; i < WSD_MAX_WINDOWS; i++)
+    {
+        if (windows[i].hwnd) continue;
+        memset( &windows[i], 0, sizeof(windows[i]) );
+        windows[i].hwnd = hwnd;
+        return &windows[i];
+    }
+    WARN( "more than %u top-level windows, %p not shown\n", WSD_MAX_WINDOWS, hwnd );
+    return NULL;
+}
+
+static void free_buffer( struct sail_buffer *buf )
+{
+    if (!buf->id) return;
+    wsd_send( WSD_BUFFER_DETACH, &(struct wsd_buffer){ buf->id }, sizeof(struct wsd_buffer), NULL, 0, -1 );
+    munmap( buf->bits, buf->map_size );
+    memset( buf, 0, sizeof(*buf) );
+}
+
+static void destroy_win( struct sail_win *win )
+{
+    UINT i;
+    for (i = 0; i < NB_BUFFERS; i++) free_buffer( &win->buffers[i] );
+    if (win->created)
+        wsd_send( WSD_WINDOW_DESTROY, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), NULL, 0, -1 );
+    memset( win, 0, sizeof(*win) );
+}
+
+static BOOL is_toplevel( HWND hwnd )
+{
+    return hwnd != NtUserGetDesktopWindow() && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow();
+}
+
+/* creates a shared memory buffer and attaches it in wsd */
+static BOOL alloc_buffer( struct sail_buffer *buf, UINT width, UINT height )
+{
+    UINT stride = (width * 4 + STRIDE_ALIGN - 1) & ~(STRIDE_ALIGN - 1);
+    size_t size = ((size_t)stride * height + SHM_ALIGN - 1) & ~(size_t)(SHM_ALIGN - 1);
+    struct wsd_buffer_attach attach;
+    void *bits;
+    int fd;
+
+    if ((fd = syscall( __NR_memfd_create, "wsd-buffer", 1 /* MFD_CLOEXEC */ )) < 0)
+    {
+        ERR( "memfd_create failed: %s\n", strerror(errno) );
+        return FALSE;
+    }
+    if (ftruncate( fd, size ) < 0 ||
+        (bits = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+    {
+        ERR( "shared buffer of %zu bytes failed: %s\n", size, strerror(errno) );
+        close( fd );
+        return FALSE;
+    }
+    memset( &attach, 0, sizeof(attach) );
+    attach.buffer_id = next_buffer_id++;
+    attach.width = width;
+    attach.height = height;
+    attach.stride = stride;
+    attach.format = WSD_FMT_BGRA8;
+    attach.offset = 0;
+    attach.size = (UINT64)stride * height;
+    if (!wsd_send( WSD_BUFFER_ATTACH, &attach, sizeof(attach), NULL, 0, fd ))
+    {
+        close( fd );
+        munmap( bits, size );
+        return FALSE;
+    }
+    close( fd );
+    buf->id = attach.buffer_id;
+    buf->bits = bits;
+    buf->map_size = size;
+    buf->width = width;
+    buf->height = height;
+    buf->stride = stride;
+    buf->busy = FALSE;
+    TRACE( "buffer %u %ux%u stride %u\n", buf->id, width, height, stride );
+    return TRUE;
+}
+
+/***********************************************************************
+ *           window surface
+ */
+static void sail_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+{
+}
+
+static BOOL sail_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+                                const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    UINT surf_width = color_info->bmiHeader.biWidth, surf_height = abs( color_info->bmiHeader.biHeight );
+    UINT src_stride = surf_width * 4, width, height, y, i;
+    int x0, y0;
+    struct sail_buffer *buf = NULL;
+    struct sail_win *win;
+    struct wsd_present present;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &win_lock );
+    if (!(win = get_win( surface->hwnd )) || !win->created) goto done;  /* stays dirty until shown */
+    if (win->external) { ret = TRUE; goto done; }
+
+    /* The surface is usually larger than the window (Wine rounds it up); present exactly the visible window:
+     * rect is the surface position relative to the visible rect, so the window starts at (-left, -top). */
+    x0 = max( 0, -rect->left );
+    y0 = max( 0, -rect->top );
+    width = min( win->width, surf_width - min( (UINT)x0, surf_width ));
+    height = min( win->height, surf_height - min( (UINT)y0, surf_height ));
+    if (!width || !height) { ret = TRUE; goto done; }
+
+    for (i = 0; i < NB_BUFFERS; i++)
+    {
+        struct sail_buffer *b = &win->buffers[i];
+        if (b->id && (b->width != width || b->height != height) && !b->busy) free_buffer( b );
+        if (!b->id && !alloc_buffer( b, width, height )) goto done;
+        if (!b->busy && b->width == width && b->height == height) { buf = b; break; }
+    }
+    if (!buf) goto done;  /* both buffers in flight, retried on the next flush */
+
+    for (y = 0; y < height; y++)
+        memcpy( (char *)buf->bits + y * buf->stride,
+                (const char *)color_bits + (y + y0) * src_stride + x0 * 4, width * 4 );
+    if (shape_bits)  /* opaque everywhere for now, wsd ignores alpha */
+        TRACE( "window shape ignored\n" );
+
+    present.window_id = win_id( win );
+    present.buffer_id = buf->id;
+    present.serial = __atomic_add_fetch( &present_serial, 1, __ATOMIC_SEQ_CST );
+    present.client_time_ns = now_ns();
+    buf->busy = TRUE;
+    if (!(ret = wsd_send( WSD_PRESENT, &present, sizeof(present), NULL, 0, -1 ))) buf->busy = FALSE;
+    if (ret && !debug_injected && getenv( "WINE_SAILOVER_DEBUG_INJECT" ))
+    {
+        /* test only, once per process: wsd feeds synthetic key, button and motion events to this window */
+        debug_injected = TRUE;
+        wsd_send( WSD_DEBUG_INJECT, &(struct wsd_window_flag){ win_id( win ), 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    }
+done:
+    pthread_mutex_unlock( &win_lock );
+    return ret;
+}
+
+static void sail_surface_destroy( struct window_surface *surface )
+{
+}
+
+static const struct window_surface_funcs sail_surface_funcs =
+{
+    sail_surface_set_clip,
+    sail_surface_flush,
+    sail_surface_destroy
+};
+
+static BOOL SAIL_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
+{
+    char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    int width = surface_rect->right - surface_rect->left, height = surface_rect->bottom - surface_rect->top;
+    struct window_surface *previous;
+
+    if ((previous = *surface) && previous->funcs == &sail_surface_funcs) return TRUE;
+    if (!is_toplevel( hwnd )) return TRUE;  /* default surface */
+    if (previous) window_surface_release( previous );
+
+    memset( info, 0, sizeof(*info) );
+    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth       = width;
+    info->bmiHeader.biHeight      = -height;  /* top-down */
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = 32;
+    info->bmiHeader.biSizeImage   = width * height * 4;
+    info->bmiHeader.biCompression = BI_RGB;
+    *surface = window_surface_create( sizeof(struct window_surface), &sail_surface_funcs, hwnd, surface_rect, info, 0 );
+    TRACE( "hwnd %p rect %s surface %p\n", hwnd, wine_dbgstr_rect( surface_rect ), *surface );
+    return TRUE;
+}
+
+/***********************************************************************
+ *           window management
+ */
+static BOOL SAIL_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
+{
+    return is_toplevel( hwnd );  /* top-level windows get a driver surface */
+}
+
+static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                   const struct window_rects *rects, struct window_surface *surface )
+{
+    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+    BOOL visible = (style & WS_VISIBLE) && !(style & WS_MINIMIZE) && !IsRectEmpty( &rects->visible );
+    BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+    UINT width = rects->visible.right - rects->visible.left, height = rects->visible.bottom - rects->visible.top;
+    struct sail_win *win;
+
+    if (!is_toplevel( hwnd )) return;
+    TRACE( "hwnd %p rects %s flags %08x visible %u fullscreen %u\n", hwnd, debugstr_window_rects( rects ),
+           swp_flags, visible, fullscreen );
+
+    pthread_mutex_lock( &win_lock );
+    if (!(win = get_win( hwnd )))
+    {
+        if (!visible || !(win = alloc_win( hwnd ))) goto done;
+    }
+    win->visible = rects->visible;
+    win->client = rects->client;
+    OffsetRect( &win->client, -rects->visible.left, -rects->visible.top );
+
+    if (visible && win->created && !fullscreen && !win->fullscreen)
+    {
+        struct wsd_window_frame frame = { win_id( win ), 0, rects->visible.left, rects->visible.top, width, height };
+        if (win->width != width || win->height != height) frame.flags |= WSD_FRAME_SIZE;
+        if (win->x != rects->visible.left || win->y != rects->visible.top) frame.flags |= WSD_FRAME_MOVE;
+        if (frame.flags) wsd_send( WSD_WINDOW_SET_FRAME, &frame, sizeof(frame), NULL, 0, -1 );
+        win->width = width;
+        win->height = height;
+        win->x = rects->visible.left;
+        win->y = rects->visible.top;
+    }
+    if (visible && (width > 16384 || height > 16384))
+    {
+        /* off-screen helper windows (Wine sizes some popups far beyond the screen): wsd limit is 16384 px */
+        TRACE( "hwnd %p too large for wsd (%ux%u), not shown\n", hwnd, width, height );
+        visible = FALSE;
+    }
+    if (visible && !win->created)
+    {
+        struct wsd_window_create create = { win_id( win ), width, height, WSD_STYLE_BORDERLESS };
+        WCHAR textW[256];
+        char title[256 * 3];
+        DWORD len = 0;
+        INT n = NtUserInternalGetWindowText( hwnd, textW, ARRAY_SIZE(textW) );
+
+        if (n > 0) RtlUnicodeToUTF8N( title, sizeof(title), &len, textW, n * sizeof(WCHAR) );
+        if (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOPMOST) create.style |= WSD_STYLE_TOPMOST;
+        if (!wsd_send( WSD_WINDOW_CREATE, &create, sizeof(create), title, len, -1 )) goto done;
+        win->created = TRUE;
+        /* nptunix (Neptune D3D presentation) finds the wsd window of a HWND through this property */
+        NtUserSetProp( hwnd, sailover_window_propW, ULongToHandle( win_id( win ) ));
+        win->width = width;
+        win->height = height;
+        win->x = rects->visible.left;
+        win->y = rects->visible.top;
+        {
+            struct wsd_window_frame frame = { win_id( win ), WSD_FRAME_MOVE, win->x, win->y, width, height };
+            wsd_send( WSD_WINDOW_SET_FRAME, &frame, sizeof(frame), NULL, 0, -1 );
+        }
+    }
+    if (win->created && visible != win->shown)
+    {
+        wsd_send( WSD_WINDOW_SHOW, &(struct wsd_window_flag){ win_id( win ), visible }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        win->shown = visible;
+    }
+    if (win->created && visible && fullscreen != win->fullscreen)
+    {
+        wsd_send( WSD_WINDOW_FULLSCREEN, &(struct wsd_window_flag){ win_id( win ), fullscreen }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        win->fullscreen = fullscreen;
+    }
+done:
+    pthread_mutex_unlock( &win_lock );
+}
+
+static void SAIL_DestroyWindow( HWND hwnd )
+{
+    struct sail_win *win;
+
+    NtUserRemoveProp( hwnd, sailover_window_propW );
+
+    pthread_mutex_lock( &win_lock );
+    if ((win = get_win( hwnd ))) destroy_win( win );
+    pthread_mutex_unlock( &win_lock );
+}
+
+static void SAIL_SetWindowText( HWND hwnd, LPCWSTR text )
+{
+    struct sail_win *win;
+    char title[1024];
+    DWORD len = 0;
+
+    if (text) RtlUnicodeToUTF8N( title, sizeof(title), &len, text, wcslen( text ) * sizeof(WCHAR) );
+    pthread_mutex_lock( &win_lock );
+    if ((win = get_win( hwnd )) && win->created)
+        wsd_send( WSD_SET_TITLE, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), title, len, -1 );
+    pthread_mutex_unlock( &win_lock );
+}
+
+/***********************************************************************
+ *           cursor
+ */
+static void SAIL_SetCursor( HWND hwnd, HCURSOR cursor )
+{
+    BOOL visible = cursor != 0;
+    if (visible == cursor_visible) return;
+    cursor_visible = visible;
+    wsd_send( WSD_CURSOR_VISIBLE, &(struct wsd_window_flag){ 0, visible }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    {
+        struct sail_win *win;
+        UINT id = 0;
+        pthread_mutex_lock( &win_lock );
+        if ((win = get_win( NtUserGetForegroundWindow() )) && win->created) id = win_id( win );
+        pthread_mutex_unlock( &win_lock );
+        update_relative_mouse( id );
+    }
+}
+
+static BOOL SAIL_ClipCursor( const RECT *clip, BOOL reset )
+{
+    HWND foreground = NtUserGetForegroundWindow();
+    struct wsd_cursor_clip req = { 0 };
+    struct sail_win *win;
+
+    pthread_mutex_lock( &win_lock );
+    if (!(win = get_win( foreground )) || !win->created)
+    {
+        pthread_mutex_unlock( &win_lock );
+        return TRUE;
+    }
+    req.window_id = win_id( win );
+    if (clip && !reset)
+    {
+        RECT rc;
+        rc.left = max( clip->left, win->visible.left );
+        rc.top = max( clip->top, win->visible.top );
+        rc.right = min( clip->right, win->visible.right );
+        rc.bottom = min( clip->bottom, win->visible.bottom );
+        if (rc.left < rc.right && rc.top < rc.bottom)
+        {
+            req.enable = 1;
+            req.x = rc.left - win->visible.left;
+            req.y = rc.top - win->visible.top;
+            req.width = rc.right - rc.left;
+            req.height = rc.bottom - rc.top;
+        }
+    }
+    pthread_mutex_unlock( &win_lock );
+    wsd_send( WSD_CURSOR_CLIP, &req, sizeof(req), NULL, 0, -1 );
+    clip_active = req.enable;
+    update_relative_mouse( req.window_id );
+    return TRUE;
+}
+
+/***********************************************************************
+ *           display devices
+ */
+static UINT SAIL_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+{
+    static const struct { UINT w, h; } extra[] = { {640,480}, {800,600}, {1024,768}, {1280,720}, {1280,800},
+                                                     {1600,900}, {1920,1080}, {2560,1440} };
+    struct pci_id pci_id = { 0 };
+    struct gdi_monitor monitor = { 0 };
+    DEVMODEW current = { .dmSize = sizeof(current) }, modes[ARRAY_SIZE(extra) + 1];
+    UINT i, count = 0, hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
+    UINT width = hello.display_width_px, height = hello.display_height_px;
+
+    if (!width || !height) return STATUS_NOT_IMPLEMENTED;
+
+    manager->add_gpu( NULL, &pci_id, NULL, param );
+    manager->add_source( "wsd", DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
+                         NtUserGetSystemDpiForProcess( NULL ), param );
+    SetRect( &monitor.rc_monitor, 0, 0, width, height );
+    monitor.rc_work = monitor.rc_monitor;
+    manager->add_monitor( &monitor, param );
+
+    current.dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                       DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY | DM_POSITION;
+    current.dmBitsPerPel = 32;
+    current.dmPelsWidth = width;
+    current.dmPelsHeight = height;
+    current.dmDisplayFrequency = hz;
+    modes[count] = current;
+    modes[count++].dmFields &= ~DM_POSITION;
+    for (i = 0; i < ARRAY_SIZE(extra); i++)
+    {
+        if (extra[i].w >= width && extra[i].h >= height) continue;
+        modes[count] = modes[0];
+        modes[count].dmPelsWidth = extra[i].w;
+        modes[count++].dmPelsHeight = extra[i].h;
+    }
+    manager->add_modes( &current, count, modes, param );
+    return STATUS_SUCCESS;
+}
+
+/***********************************************************************
+ *           input
+ */
+static const struct { BYTE kvk; BYTE vk; WORD scan; } keymap[] =
+{
+    {0x00,'A',0x1e},{0x01,'S',0x1f},{0x02,'D',0x20},{0x03,'F',0x21},{0x04,'H',0x23},{0x05,'G',0x22},
+    {0x06,'Z',0x2c},{0x07,'X',0x2d},{0x08,'C',0x2e},{0x09,'V',0x2f},{0x0b,'B',0x30},{0x0c,'Q',0x10},
+    {0x0d,'W',0x11},{0x0e,'E',0x12},{0x0f,'R',0x13},{0x10,'Y',0x15},{0x11,'T',0x14},{0x12,'1',0x02},
+    {0x13,'2',0x03},{0x14,'3',0x04},{0x15,'4',0x05},{0x16,'6',0x07},{0x17,'5',0x06},{0x18,VK_OEM_PLUS,0x0d},
+    {0x19,'9',0x0a},{0x1a,'7',0x08},{0x1b,VK_OEM_MINUS,0x0c},{0x1c,'8',0x09},{0x1d,'0',0x0b},
+    {0x1e,VK_OEM_6,0x1b},{0x1f,'O',0x18},{0x20,'U',0x16},{0x21,VK_OEM_4,0x1a},{0x22,'I',0x17},{0x23,'P',0x19},
+    {0x24,VK_RETURN,0x1c},{0x25,'L',0x26},{0x26,'J',0x24},{0x27,VK_OEM_7,0x28},{0x28,'K',0x25},
+    {0x29,VK_OEM_1,0x27},{0x2a,VK_OEM_5,0x2b},{0x2b,VK_OEM_COMMA,0x33},{0x2c,VK_OEM_2,0x35},{0x2d,'N',0x31},
+    {0x2e,'M',0x32},{0x2f,VK_OEM_PERIOD,0x34},{0x30,VK_TAB,0x0f},{0x31,VK_SPACE,0x39},{0x32,VK_OEM_3,0x29},
+    {0x33,VK_BACK,0x0e},{0x35,VK_ESCAPE,0x01},{0x36,VK_RWIN,0x15c},{0x37,VK_LWIN,0x15b},{0x38,VK_LSHIFT,0x2a},
+    {0x39,VK_CAPITAL,0x3a},{0x3a,VK_LMENU,0x38},{0x3b,VK_LCONTROL,0x1d},{0x3c,VK_RSHIFT,0x36},
+    {0x3d,VK_RMENU,0x138},{0x3e,VK_RCONTROL,0x11d},{0x60,VK_F5,0x3f},{0x61,VK_F6,0x40},{0x62,VK_F7,0x41},
+    {0x63,VK_F3,0x3d},{0x64,VK_F8,0x42},{0x65,VK_F9,0x43},{0x67,VK_F11,0x57},{0x6d,VK_F10,0x44},
+    {0x6f,VK_F12,0x58},{0x73,VK_HOME,0x147},{0x74,VK_PRIOR,0x149},{0x75,VK_DELETE,0x153},{0x76,VK_F4,0x3e},
+    {0x77,VK_END,0x14f},{0x78,VK_F2,0x3c},{0x79,VK_NEXT,0x151},{0x7a,VK_F1,0x3b},{0x7b,VK_LEFT,0x14b},
+    {0x7c,VK_RIGHT,0x14d},{0x7d,VK_DOWN,0x150},{0x7e,VK_UP,0x148},
+};
+
+static void send_key( HWND hwnd, const struct wsd_ev_key *ev )
+{
+    INPUT input = { .type = INPUT_KEYBOARD };
+    UINT i;
+
+    for (i = 0; i < ARRAY_SIZE(keymap); i++) if (keymap[i].kvk == ev->mac_keycode) break;
+    if (i == ARRAY_SIZE(keymap))
+    {
+        TRACE( "unmapped mac keycode %#x\n", ev->mac_keycode );
+        return;
+    }
+    input.ki.wVk = keymap[i].vk;
+    input.ki.wScan = keymap[i].scan & 0xff;
+    if (keymap[i].scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    if (!(ev->flags & WSD_KEY_DOWN)) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    TRACE( "hwnd %p kvk %#x vk %#x flags %#x\n", hwnd, ev->mac_keycode, input.ki.wVk, input.ki.dwFlags );
+    NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+}
+
+static void send_mouse( HWND hwnd, DWORD flags, int x, int y, DWORD data )
+{
+    INPUT input = { .type = INPUT_MOUSE };
+
+    input.mi.dx = x;
+    input.mi.dy = y;
+    input.mi.mouseData = data;
+    input.mi.dwFlags = flags;
+    TRACE( "hwnd %p flags %#x %d,%d data %#x\n", hwnd, (UINT)flags, x, y, (UINT)data );
+    NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+}
+
+static void handle_event( const struct wsd_hdr *hdr, const char *payload )
+{
+    const struct wsd_window *w = (const struct wsd_window *)payload;
+    struct sail_win *win = NULL;
+    HWND hwnd = 0;
+    RECT visible = { 0 };
+
+    if (hdr->type != WSD_EV_RELEASE && hdr->type != WSD_EV_PRESENTED && hdr->type != WSD_EV_ERROR && hdr->len >= 4)
+    {
+        pthread_mutex_lock( &win_lock );
+        if ((win = get_win_by_id( w->window_id )))
+        {
+            hwnd = win->hwnd;
+            visible = win->visible;
+        }
+        pthread_mutex_unlock( &win_lock );
+    }
+
+    switch (hdr->type)
+    {
+    case WSD_EV_RELEASE:
+    {
+        const struct wsd_ev_release *ev = (const void *)payload;
+        void (*listener)( UINT, UINT, UINT64 ) = release_listener;
+        UINT i, j;
+        if (listener && (ev->buffer_id & 0x80000000)) listener( ev->buffer_id, ev->shown, ev->serial );
+        pthread_mutex_lock( &win_lock );
+        for (i = 0; i < WSD_MAX_WINDOWS; i++)
+            for (j = 0; j < NB_BUFFERS; j++)
+                if (windows[i].buffers[j].id == ev->buffer_id) windows[i].buffers[j].busy = FALSE;
+        pthread_mutex_unlock( &win_lock );
+        break;
+    }
+    case WSD_EV_PRESENTED:
+    {
+        const struct wsd_ev_presented *ev = (const void *)payload;
+        void (*listener)( UINT, UINT64, UINT64 ) = presented_listener;
+        if (listener && (ev->buffer_id & 0x80000000)) listener( ev->buffer_id, ev->serial, ev->presented_ns );
+        break;
+    }
+    case WSD_EV_KEY:
+    {
+        const struct wsd_ev_key *ev = (const void *)payload;
+        UINT64 rx = latency_trace ? now_ns() : 0;
+        if (hwnd) send_key( hwnd, ev );
+        /* guest CLOCK_MONOTONIC is the host CLOCK_UPTIME_RAW under LKD, so these are comparable to wsd times */
+        if (latency_trace)
+            fprintf( stderr, "winesailover latency: key %#x %s event %llu read +%.3f ms sent +%.3f ms\n",
+                     ev->mac_keycode, (ev->flags & WSD_KEY_DOWN) ? "down" : "up", (unsigned long long)ev->time_ns,
+                     (rx - ev->time_ns) / 1e6, (now_ns() - ev->time_ns) / 1e6 );
+        break;
+    }
+    case WSD_EV_MOTION:
+    {
+        const struct wsd_ev_motion *ev = (const void *)payload;
+        if (hwnd) send_mouse( hwnd, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                              visible.left + (int)ev->x, visible.top + (int)ev->y, 0 );
+        break;
+    }
+    case WSD_EV_RELATIVE:
+    {
+        const struct wsd_ev_relative *ev = (const void *)payload;
+        if (hwnd) send_mouse( hwnd, MOUSEEVENTF_MOVE, (int)ev->dx, (int)ev->dy, 0 );
+        break;
+    }
+    case WSD_EV_BUTTON:
+    {
+        const struct wsd_ev_button *ev = (const void *)payload;
+        DWORD flags, data = 0;
+        if (!hwnd) break;
+        switch (ev->button)
+        {
+        case 0: flags = MOUSEEVENTF_LEFTDOWN; break;
+        case 1: flags = MOUSEEVENTF_RIGHTDOWN; break;
+        case 2: flags = MOUSEEVENTF_MIDDLEDOWN; break;
+        case 3: flags = MOUSEEVENTF_XDOWN; data = XBUTTON1; break;
+        case 4: flags = MOUSEEVENTF_XDOWN; data = XBUTTON2; break;
+        default: flags = 0; break;
+        }
+        if (!flags) break;
+        if (!ev->down) flags <<= 1;
+        send_mouse( hwnd, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    visible.left + (int)ev->x, visible.top + (int)ev->y, 0 );
+        send_mouse( hwnd, flags, 0, 0, data );
+        break;
+    }
+    case WSD_EV_WHEEL:
+    {
+        const struct wsd_ev_wheel *ev = (const void *)payload;
+        if (!hwnd) break;
+        if (ev->dy) send_mouse( hwnd, MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(int)(ev->dy * (ev->precise ? 4 : WHEEL_DELTA)) );
+        if (ev->dx) send_mouse( hwnd, MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)(int)(-ev->dx * (ev->precise ? 4 : WHEEL_DELTA)) );
+        break;
+    }
+    case WSD_EV_FOCUS:
+    {
+        const struct wsd_window_flag *ev = (const void *)payload;
+        TRACE( "focus %u hwnd %p\n", ev->value, hwnd );
+        if (hwnd && ev->value) NtUserSetForegroundWindow( hwnd );
+        break;
+    }
+    case WSD_EV_CLOSE:
+        if (hwnd) NtUserPostMessage( hwnd, WM_SYSCOMMAND, SC_CLOSE, 0 );
+        break;
+    case WSD_EV_RESIZE:
+    {
+        const struct wsd_ev_resize *ev = (const void *)payload;
+        TRACE( "hwnd %p resized to %ux%u\n", hwnd, ev->width_px, ev->height_px );
+        break;
+    }
+    case WSD_EV_ERROR:
+    {
+        const struct wsd_ev_error *ev = (const void *)payload;
+        ERR( "wsd rejected request %u: %d\n", ev->request_type, ev->code );
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/***********************************************************************
+ *           API for other unix libraries of the process (nptunix.so, Neptune D3D presentation)
+ *
+ * Found with dlopen( "winesailover.so", RTLD_NOLOAD ) + dlsym. Buffer ids with bit 31 set belong to the caller;
+ * their EV_RELEASE events go to the listener (called on the event thread).
+ */
+#define SAILOVER_EXPORT __attribute__((visibility("default")))
+
+SAILOVER_EXPORT BOOL sailover_wsd_send( UINT type, const void *payload, UINT len, int fd )
+{
+    return wsd_send( type, payload, len, NULL, 0, fd );
+}
+
+SAILOVER_EXPORT void sailover_wsd_set_release_listener( void (*listener)( UINT buffer_id, UINT shown, UINT64 serial ) )
+{
+    release_listener = listener;
+}
+
+SAILOVER_EXPORT void sailover_wsd_set_presented_listener( void (*listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns ) )
+{
+    presented_listener = listener;
+}
+
+/* client area of a wsd window, in window pixels (top-left of the window's visible rect) */
+SAILOVER_EXPORT BOOL sailover_wsd_client_rect( UINT window_id, int *x, int *y, UINT *width, UINT *height )
+{
+    struct sail_win *win;
+    BOOL ret = FALSE;
+    pthread_mutex_lock( &win_lock );
+    if ((win = get_win_by_id( window_id )) && win->client.right > win->client.left && win->client.bottom > win->client.top)
+    {
+        *x = win->client.left;
+        *y = win->client.top;
+        *width = win->client.right - win->client.left;
+        *height = win->client.bottom - win->client.top;
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &win_lock );
+    return ret;
+}
+
+SAILOVER_EXPORT void sailover_wsd_set_external( UINT window_id, BOOL external )
+{
+    struct sail_win *win;
+    pthread_mutex_lock( &win_lock );
+    if ((win = get_win_by_id( window_id ))) win->external = external;
+    pthread_mutex_unlock( &win_lock );
+}
+
+SAILOVER_EXPORT BOOL sailover_wsd_get_display( UINT *width, UINT *height, UINT *refresh_hz )
+{
+    if (!hello.display_width_px) return FALSE;
+    *width = hello.display_width_px;
+    *height = hello.display_height_px;
+    *refresh_hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
+    return TRUE;
+}
+
+SAILOVER_EXPORT UINT64 sailover_wsd_next_serial(void)
+{
+    return __atomic_add_fetch( &present_serial, 1, __ATOMIC_SEQ_CST );
+}
+
+/***********************************************************************
+ *           unix calls
+ */
+static const struct user_driver_funcs sailoverdrv_funcs =
+{
+    .pClipCursor = SAIL_ClipCursor,
+    .pCreateWindowSurface = SAIL_CreateWindowSurface,
+    .pDestroyWindow = SAIL_DestroyWindow,
+    .pSetCursor = SAIL_SetCursor,
+    .pSetWindowText = SAIL_SetWindowText,
+    .pUpdateDisplayDevices = SAIL_UpdateDisplayDevices,
+    .pWindowPosChanged = SAIL_WindowPosChanged,
+    .pWindowPosChanging = SAIL_WindowPosChanging,
+};
+
+static NTSTATUS sailoverdrv_init( void *arg )
+{
+    const char *path = getenv( "WINE_SAILOVER_SOCKET" );
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    struct wsd_hello req = { WSD_PROTOCOL_VERSION, getpid() };
+    char payload[WSD_MAX_PAYLOAD];
+    struct wsd_hdr hdr;
+
+    if (!path) path = "/run/sailover/wsd.sock";
+    if (strlen( path ) >= sizeof(addr.sun_path)) return STATUS_UNSUCCESSFUL;
+    strcpy( addr.sun_path, path );
+    if ((wsd_fd = socket( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0 )) < 0) return STATUS_UNSUCCESSFUL;
+    if (connect( wsd_fd, (struct sockaddr *)&addr, sizeof(addr) ) < 0)
+    {
+        WARN( "cannot connect to wsd at %s: %s\n", path, strerror(errno) );
+        goto fail;
+    }
+    if (!wsd_send( WSD_HELLO, &req, sizeof(req), NULL, 0, -1 )) goto fail;
+    do
+    {
+        if (!wsd_read( &hdr, payload )) goto fail;
+    } while (hdr.type != WSD_EV_HELLO);
+    memcpy( &hello, payload, min( hdr.len, sizeof(hello) ));
+    TRACE( "wsd pid %u display %ux%u @%u Hz scale %u/1000\n", hello.server_pid, hello.display_width_px,
+           hello.display_height_px, hello.max_refresh_hz, hello.backing_scale_x1000 );
+    __wine_set_user_driver( &sailoverdrv_funcs, WINE_GDI_DRIVER_VERSION );
+    return STATUS_SUCCESS;
+
+fail:
+    close( wsd_fd );
+    wsd_fd = -1;
+    return STATUS_UNSUCCESSFUL;
+}
+
+static NTSTATUS sailoverdrv_read_events( void *arg )
+{
+    char payload[WSD_MAX_PAYLOAD];
+    struct wsd_hdr hdr;
+
+    latency_trace = getenv( "WINE_SAILOVER_LATENCY" ) != NULL;
+
+    while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
+    return STATUS_UNSUCCESSFUL;
+}
+
+const unixlib_entry_t __wine_unix_call_funcs[] =
+{
+    sailoverdrv_init,
+    sailoverdrv_read_events,
+};
+
+C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == sailoverdrv_unix_func_count );

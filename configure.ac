@@ -1089,6 +1089,14 @@ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
 
+dnl SailOver: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
+case $host_os in
+  linux*) ;;
+  *)
+    enable_winesailover_drv=${enable_winesailover_drv:-no}
+    ;;
+esac
+
 dnl **** External libraries ****
 
 if test "x$with_system_dllpath" != "x" -a -n "$PE_ARCHS"
@@ -3392,6 +3400,7 @@ WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)
 WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)
+WINE_CONFIG_MAKEFILE(dlls/winesailover.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
 WINE_CONFIG_MAKEFILE(dlls/winevulkan)
 WINE_CONFIG_MAKEFILE(dlls/winewayland.drv)
