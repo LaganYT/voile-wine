@@ -2985,7 +2985,10 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     is_name_8_dot_3 = is_name_8_dot_3 && length >= 8 && name[4] == '~';
 #endif
 
-    if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+    /* A case-insensitive directory finds every name by itself, except the hashed short names Wine makes up
+     * (XXXX~YYY.EXT): other 8.3 names do not need the listing either. */
+    if (!(is_name_8_dot_3 && length >= 8 && name[4] == '~') && !get_dir_case_sensitivity( root_fd, unix_name ))
+        goto not_found;
 
     /* now look for it through the directory */
 
