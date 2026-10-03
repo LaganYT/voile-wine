@@ -319,6 +319,7 @@ static unsigned int update_if_table( void )
      * example gethostbyname() of the own host name) blocked forever. */
     if (!indices)
     {
+#ifdef SIOCGIFINDEX
         /* fallback without netlink: SIOCGIFCONF lists the configured interfaces, SIOCGIFINDEX gives their index */
         struct ifconf ifc;
         struct ifreq reqs[32];
@@ -341,6 +342,10 @@ static unsigned int update_if_table( void )
         else WARN( "SIOCGIFCONF failed: %s\n", strerror( errno ));
         close( fd );
         return append_count;
+#else
+        WARN( "if_nameindex failed: %s\n", strerror( errno ));
+        return 0;
+#endif
     }
 
     for (entry = indices; entry->if_index; entry++)
