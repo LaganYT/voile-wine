@@ -1,0 +1,1219 @@
+/*
+ * SailOver audio driver (unixlib): WASAPI render streams played by the SailOver window server (wsd) on macOS.
+ *
+ * Copyright 2011 Andrew Eikum for CodeWeavers
+ *           2022 Huw Davies
+ * Copyright 2026 SailOver
+ *
+ * Derived from the OSS driver (dlls/wineoss.drv/oss.c): the same local buffer and timer loop, with the OSS device
+ * replaced by a ring of frames shared with wsd (a memfd, struct wsd_audio_ring in wsd_protocol.h). The timer loop
+ * copies the frames the application released into the ring; wsd's CoreAudio render callback consumes them and
+ * publishes how far it has read, which drives the padding and the position like GETOSPACE does for OSS.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include <stdarg.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "winternl.h"
+#include "initguid.h"
+#include "audioclient.h"
+#include "mmddk.h"
+
+#include "wine/debug.h"
+#include "wine/unixlib.h"
+
+#include "../mmdevapi/unixlib.h"
+#include "wsd_protocol.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(sailaudio);
+
+struct sail_stream
+{
+    WAVEFORMATEX *fmt;
+    EDataFlow flow;
+    UINT flags;
+    AUDCLNT_SHAREMODE share;
+    HANDLE event;
+
+    UINT32 stream_id;
+    struct wsd_audio_ring *ring;
+    BYTE *ring_data;
+    void *map;
+    SIZE_T map_len;
+    UINT32 ring_frames;
+    UINT64 ring_written; /* frames published to the ring (ring->write_frames) */
+
+    BOOL playing, mute, please_quit;
+    UINT64 written_frames, last_pos_frames;
+    UINT32 period_frames, bufsize_frames, held_frames, tmp_buffer_frames, in_ring_frames;
+    UINT32 lcl_offs_frames; /* offs into local_buffer where valid data starts */
+    REFERENCE_TIME period;
+
+    BYTE *local_buffer, *tmp_buffer;
+    INT32 getbuf_last; /* <0 when using tmp_buffer */
+
+    pthread_mutex_t lock;
+};
+
+static const REFERENCE_TIME def_period = 100000;
+static const REFERENCE_TIME min_period = 50000;
+static const char device_name[] = "wsd";
+
+static ULONG_PTR zero_bits = 0;
+
+/* One connection to wsd per process, opened on first use. */
+static pthread_mutex_t wsd_lock = PTHREAD_MUTEX_INITIALIZER;
+static int wsd_fd = -1;
+static UINT32 next_stream_id = 1;
+
+static NTSTATUS sail_not_implemented(void *args)
+{
+    return STATUS_SUCCESS;
+}
+
+/* copied from kernelbase */
+static int muldiv( int a, int b, int c )
+{
+    LONGLONG ret;
+
+    if (!c) return -1;
+
+    /* We want to deal with a positive divisor to simplify the logic. */
+    if (c < 0)
+    {
+        a = -a;
+        c = -c;
+    }
+
+    /* If the result is positive, we "add" to round. else, we subtract to round. */
+    if ((a < 0 && b < 0) || (a >= 0 && b >= 0))
+        ret = (((LONGLONG)a * b) + (c / 2)) / c;
+    else
+        ret = (((LONGLONG)a * b) - (c / 2)) / c;
+
+    if (ret > 2147483647 || ret < -2147483647) return -1;
+    return ret;
+}
+
+static const char *socket_path(void)
+{
+    const char *path = getenv("WINE_SAILOVER_SOCKET");
+    return path ? path : "/run/sailover/wsd.sock";
+}
+
+static BOOL write_all(int fd, const void *data, size_t size, int fd_to_send)
+{
+    const char *ptr = data;
+    BOOL first = TRUE;
+
+    while (size)
+    {
+        struct iovec iov = { (void *)ptr, size };
+        char control[CMSG_SPACE(sizeof(int))];
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+        ssize_t ret;
+
+        if (first && fd_to_send != -1)
+        {
+            struct cmsghdr *cmsg;
+            memset(control, 0, sizeof(control));
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof(control);
+            cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+        }
+        ret = sendmsg(fd, &msg, MSG_NOSIGNAL);
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;
+            WARN("sendmsg failed: %s\n", strerror(errno));
+            return FALSE;
+        }
+        first = FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+static BOOL read_all(int fd, void *data, size_t size)
+{
+    char *ptr = data;
+    while (size)
+    {
+        ssize_t ret = read(fd, ptr, size);
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret <= 0) return FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+/* called with wsd_lock held */
+static BOOL wsd_connect(void)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    struct wsd_hello req = { WSD_PROTOCOL_VERSION, getpid() };
+    struct { struct wsd_hdr hdr; struct wsd_hello msg; } hello = { { WSD_HELLO, sizeof(req) }, req };
+    char payload[WSD_MAX_PAYLOAD];
+    struct wsd_hdr hdr;
+    const char *path = socket_path();
+    int fd;
+
+    if (wsd_fd != -1) return TRUE;
+    if (strlen(path) >= sizeof(addr.sun_path)) return FALSE;
+    strcpy(addr.sun_path, path);
+    if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) return FALSE;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || !write_all(fd, &hello, sizeof(hello), -1))
+    {
+        WARN("cannot connect to wsd at %s: %s\n", path, strerror(errno));
+        close(fd);
+        return FALSE;
+    }
+    /* the server answers HELLO before anything else; later replies are only errors, which nothing waits for */
+    do
+    {
+        if (!read_all(fd, &hdr, sizeof(hdr)) || hdr.len > sizeof(payload) || !read_all(fd, payload, hdr.len))
+        {
+            close(fd);
+            return FALSE;
+        }
+    } while (hdr.type != WSD_EV_HELLO);
+    wsd_fd = fd;
+    return TRUE;
+}
+
+static BOOL wsd_send(UINT32 type, const void *payload, UINT32 len, int fd_to_send)
+{
+    char buf[sizeof(struct wsd_hdr) + 64];
+    struct wsd_hdr *hdr = (struct wsd_hdr *)buf;
+    BOOL ret;
+
+    if (len > sizeof(buf) - sizeof(*hdr)) return FALSE;
+    hdr->type = type;
+    hdr->len = len;
+    memcpy(hdr + 1, payload, len);
+    pthread_mutex_lock(&wsd_lock);
+    ret = wsd_connect() && write_all(wsd_fd, buf, sizeof(*hdr) + len, fd_to_send);
+    pthread_mutex_unlock(&wsd_lock);
+    return ret;
+}
+
+/* Sends a request and waits until wsd has handled it (PING behind it, PONG back): FALSE if it answered the request
+ * with an error. Other replies on this connection are only errors of earlier requests, read and dropped here. */
+static BOOL wsd_request_sync(UINT32 type, const void *payload, UINT32 len, int fd_to_send)
+{
+    static UINT64 token;
+    char buf[sizeof(struct wsd_hdr) + 64], reply[WSD_MAX_PAYLOAD];
+    struct wsd_hdr *hdr = (struct wsd_hdr *)buf, in;
+    struct { struct wsd_hdr hdr; struct wsd_ping ping; } ping;
+    BOOL ok = FALSE, failed = FALSE;
+
+    if (len > sizeof(buf) - sizeof(*hdr)) return FALSE;
+    hdr->type = type;
+    hdr->len = len;
+    memcpy(hdr + 1, payload, len);
+    pthread_mutex_lock(&wsd_lock);
+    ping.hdr.type = WSD_PING;
+    ping.hdr.len = sizeof(ping.ping);
+    ping.ping.token = ++token;
+    ping.ping.time_ns = 0;
+    if (wsd_connect() && write_all(wsd_fd, buf, sizeof(*hdr) + len, fd_to_send) &&
+        write_all(wsd_fd, &ping, sizeof(ping), -1))
+    {
+        for (;;)
+        {
+            if (!read_all(wsd_fd, &in, sizeof(in)) || in.len > sizeof(reply) || !read_all(wsd_fd, reply, in.len)) break;
+            if (in.type == WSD_EV_ERROR && in.len >= sizeof(struct wsd_ev_error) &&
+                ((struct wsd_ev_error *)reply)->request_type == type)
+            {
+                WARN("wsd refused request %u: %d\n", type, ((struct wsd_ev_error *)reply)->code);
+                failed = TRUE;
+            }
+            if (in.type == WSD_EV_PONG && in.len >= sizeof(struct wsd_ping) &&
+                ((struct wsd_ping *)reply)->token == ping.ping.token)
+            {
+                ok = !failed;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&wsd_lock);
+    return ok;
+}
+
+static void sail_lock(struct sail_stream *stream)
+{
+    pthread_mutex_lock(&stream->lock);
+}
+
+static void sail_unlock(struct sail_stream *stream)
+{
+    pthread_mutex_unlock(&stream->lock);
+}
+
+static NTSTATUS sail_unlock_result(struct sail_stream *stream,
+                                   HRESULT *result, HRESULT value)
+{
+    *result = value;
+    sail_unlock(stream);
+    return STATUS_SUCCESS;
+}
+
+static struct sail_stream *handle_get_stream(stream_handle h)
+{
+    return (struct sail_stream *)(UINT_PTR)h;
+}
+
+static NTSTATUS sail_test_connect(void *args)
+{
+    struct test_connect_params *params = args;
+    BOOL ok;
+
+    pthread_mutex_lock(&wsd_lock);
+    ok = wsd_connect();
+    pthread_mutex_unlock(&wsd_lock);
+    params->priority = ok ? Priority_Preferred : Priority_Unavailable;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_process_attach(void *args)
+{
+#ifdef _WIN64
+    if (NtCurrentTeb()->WowTebOffset)
+    {
+        SYSTEM_BASIC_INFORMATION info;
+
+        NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+        zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_main_loop(void *args)
+{
+    struct main_loop_params *params = args;
+    NtSetEvent(params->event, NULL);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_get_endpoint_ids(void *args)
+{
+    static const WCHAR name[] = {'S','p','e','a','k','e','r','s',' ','(','m','a','c','O','S',')',0};
+    struct get_endpoint_ids_params *params = args;
+    unsigned int needed, offset;
+    struct endpoint *endpoint = params->endpoints;
+
+    params->default_idx = 0;
+    if (params->flow != eRender)
+    {
+        /* no capture device yet */
+        params->num = 0;
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    offset = sizeof(*endpoint);
+    needed = offset + sizeof(name) + ((sizeof(device_name) + 1) & ~1);
+    params->num = 1;
+    if (needed > params->size)
+    {
+        params->size = needed;
+        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        return STATUS_SUCCESS;
+    }
+    endpoint->name = offset;
+    memcpy((char *)params->endpoints + offset, name, sizeof(name));
+    offset += sizeof(name);
+    endpoint->device = offset;
+    memcpy((char *)params->endpoints + offset, device_name, sizeof(device_name));
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static UINT get_channel_mask(unsigned int channels)
+{
+    switch(channels){
+    case 0:
+        return 0;
+    case 1:
+        return KSAUDIO_SPEAKER_MONO;
+    case 2:
+        return KSAUDIO_SPEAKER_STEREO;
+    case 3:
+        return KSAUDIO_SPEAKER_STEREO | SPEAKER_LOW_FREQUENCY;
+    case 4:
+        return KSAUDIO_SPEAKER_QUAD;    /* not _SURROUND */
+    case 5:
+        return KSAUDIO_SPEAKER_QUAD | SPEAKER_LOW_FREQUENCY;
+    case 6:
+        return KSAUDIO_SPEAKER_5POINT1; /* not 5POINT1_SURROUND */
+    case 7:
+        return KSAUDIO_SPEAKER_5POINT1 | SPEAKER_BACK_CENTER;
+    case 8:
+        return KSAUDIO_SPEAKER_7POINT1_SURROUND; /* Vista deprecates 7POINT1 */
+    }
+    FIXME("Unknown speaker configuration: %u\n", channels);
+    return 0;
+}
+
+/* WSD_AUDIO_* sample format of a WAVEFORMATEX, 0 if wsd cannot play it */
+static UINT32 get_wsd_format(const WAVEFORMATEX *fmt)
+{
+    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
+
+    if(fmt->wFormatTag == WAVE_FORMAT_PCM ||
+            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM))){
+        switch(fmt->wBitsPerSample){
+        case 8:
+            return WSD_AUDIO_U8;
+        case 16:
+            return WSD_AUDIO_S16;
+        case 24:
+            return WSD_AUDIO_S24;
+        case 32:
+            return WSD_AUDIO_S32;
+        }
+        return 0;
+    }
+
+    if(fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)))
+        return fmt->wBitsPerSample == 32 ? WSD_AUDIO_F32 : 0;
+
+    return 0;
+}
+
+static WAVEFORMATEXTENSIBLE *clone_format(const WAVEFORMATEX *fmt)
+{
+    WAVEFORMATEXTENSIBLE *ret;
+    size_t size;
+
+    if(fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+        size = sizeof(WAVEFORMATEXTENSIBLE);
+    else
+        size = sizeof(WAVEFORMATEX);
+
+    ret = malloc(size);
+    if(!ret)
+        return NULL;
+
+    memcpy(ret, fmt, size);
+
+    ret->Format.cbSize = size - sizeof(WAVEFORMATEX);
+
+    return ret;
+}
+
+/* what setup_oss_device checks, for a device that plays any PCM layout CoreAudio can convert */
+static HRESULT check_format(AUDCLNT_SHAREMODE share, const WAVEFORMATEX *fmt)
+{
+    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
+    HRESULT ret = S_OK;
+
+    if(!get_wsd_format(fmt))
+        return AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+    if(fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+            (fmtex->Format.nAvgBytesPerSec == 0 ||
+             fmtex->Format.nBlockAlign == 0 ||
+             fmtex->Samples.wValidBitsPerSample > fmtex->Format.wBitsPerSample))
+        return E_INVALIDARG;
+
+    if(fmt->nChannels == 0 || fmt->nChannels > 8 || fmt->nSamplesPerSec < 4000 || fmt->nSamplesPerSec > 384000)
+        return AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+    if(fmt->nBlockAlign != fmt->nChannels * fmt->wBitsPerSample / 8 ||
+            fmt->nAvgBytesPerSec != fmt->nBlockAlign * fmt->nSamplesPerSec ||
+            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             fmtex->Samples.wValidBitsPerSample < fmtex->Format.wBitsPerSample))
+        ret = S_FALSE;
+
+    if(share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
+            fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE){
+        if(fmtex->dwChannelMask == 0 || fmtex->dwChannelMask & SPEAKER_RESERVED)
+            ret = S_FALSE;
+    }
+
+    return ret;
+}
+
+/* the shared ring and its server side stream */
+static HRESULT open_ring(struct sail_stream *stream)
+{
+    struct wsd_audio_open o;
+    SIZE_T size;
+    int fd;
+
+    /* several periods ahead like OSS fragments, at least 100 ms */
+    stream->ring_frames = max(stream->period_frames * 4, stream->fmt->nSamplesPerSec / 10);
+    size = sizeof(struct wsd_audio_ring) + (SIZE_T)stream->ring_frames * stream->fmt->nBlockAlign;
+    if((fd = syscall(__NR_memfd_create, "wsd-audio", 1 /* MFD_CLOEXEC */)) < 0){
+        WARN("memfd_create failed: %s\n", strerror(errno));
+        return E_FAIL;
+    }
+    if(ftruncate(fd, (size + 0xffff) & ~(SIZE_T)0xffff) < 0 || /* whole host pages for wsd's mapping */
+       (stream->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED){
+        WARN("ring setup failed: %s\n", strerror(errno));
+        stream->map = NULL;
+        close(fd);
+        return E_FAIL;
+    }
+    stream->map_len = size;
+    stream->ring = stream->map;
+    stream->ring_data = (BYTE *)stream->map + sizeof(struct wsd_audio_ring);
+
+    pthread_mutex_lock(&wsd_lock);
+    stream->stream_id = next_stream_id++;
+    pthread_mutex_unlock(&wsd_lock);
+    memset(&o, 0, sizeof(o));
+    o.stream_id = stream->stream_id;
+    o.format = get_wsd_format(stream->fmt);
+    o.rate = stream->fmt->nSamplesPerSec;
+    o.channels = stream->fmt->nChannels;
+    o.frame_bytes = stream->fmt->nBlockAlign;
+    o.ring_frames = stream->ring_frames;
+    o.offset = 0;
+    o.size = size;
+    if(!wsd_request_sync(WSD_AUDIO_OPEN, &o, sizeof(o), fd)){
+        close(fd);
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    }
+    close(fd); /* wsd has its own descriptor and mapping */
+    TRACE("stream %u: format %u, %u Hz, %u channels, ring %u frames\n", o.stream_id, o.format, o.rate,
+          o.channels, o.ring_frames);
+    return S_OK;
+}
+
+static void stream_command(struct sail_stream *stream, UINT32 type)
+{
+    struct wsd_audio_stream s = { stream->stream_id, 0 };
+    if(!wsd_send(type, &s, sizeof(s), -1))
+        WARN("stream %u: request %u not sent\n", stream->stream_id, type);
+}
+
+static NTSTATUS sail_create_stream(void *args)
+{
+    struct create_stream_params *params = args;
+    WAVEFORMATEXTENSIBLE *fmtex;
+    struct sail_stream *stream;
+    SIZE_T size;
+
+    if(params->flow != eRender){
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
+
+    params->result = check_format(params->share, params->fmt);
+    if(FAILED(params->result))
+        return STATUS_SUCCESS;
+
+    stream = calloc(1, sizeof(*stream));
+    if(!stream){
+        params->result = E_OUTOFMEMORY;
+        return STATUS_SUCCESS;
+    }
+
+    stream->flow = params->flow;
+    pthread_mutex_init(&stream->lock, NULL);
+
+    fmtex = clone_format(params->fmt);
+    if(!fmtex){
+        params->result = E_OUTOFMEMORY;
+        goto exit;
+    }
+    stream->fmt = &fmtex->Format;
+
+    stream->period = params->period;
+    stream->period_frames = muldiv(params->fmt->nSamplesPerSec, params->period, 10000000);
+
+    stream->bufsize_frames = muldiv(params->duration, params->fmt->nSamplesPerSec, 10000000);
+    if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
+        stream->bufsize_frames -= stream->bufsize_frames % stream->period_frames;
+    size = stream->bufsize_frames * params->fmt->nBlockAlign;
+    if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
+                               &size, MEM_COMMIT, PAGE_READWRITE)){
+        params->result = E_OUTOFMEMORY;
+        goto exit;
+    }
+
+    stream->share = params->share;
+    stream->flags = params->flags;
+
+    if(FAILED(params->result = open_ring(stream)))
+        goto exit;
+    params->result = S_OK;
+
+exit:
+    if(FAILED(params->result)){
+        if(stream->map) munmap(stream->map, stream->map_len);
+        if(stream->local_buffer){
+            size = 0;
+            NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
+        }
+        pthread_mutex_destroy(&stream->lock);
+        free(stream->fmt);
+        free(stream);
+    }else{
+        *params->channel_count = params->fmt->nChannels;
+        *params->stream = (stream_handle)(UINT_PTR)stream;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_release_stream(void *args)
+{
+    struct release_stream_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    SIZE_T size;
+
+    if(params->timer_thread){
+        stream->please_quit = TRUE;
+        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+        NtClose(params->timer_thread);
+    }
+
+    stream_command(stream, WSD_AUDIO_CLOSE);
+    if(stream->map) munmap(stream->map, stream->map_len);
+    if(stream->local_buffer){
+        size = 0;
+        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
+    }
+    if(stream->tmp_buffer){
+        size = 0;
+        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
+    }
+    free(stream->fmt);
+    pthread_mutex_destroy(&stream->lock);
+    free(stream);
+
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_start(void *args)
+{
+    struct start_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    if((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_SET);
+
+    if(stream->playing)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
+
+    stream->playing = TRUE;
+    stream_command(stream, WSD_AUDIO_START);
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_stop(void *args)
+{
+    struct stop_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    if(!stream->playing)
+        return sail_unlock_result(stream, &params->result, S_FALSE);
+
+    stream->playing = FALSE;
+    stream_command(stream, WSD_AUDIO_STOP); /* pause: the frames in the ring stay queued */
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_reset(void *args)
+{
+    struct reset_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    if(stream->playing)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
+
+    if(stream->getbuf_last)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING);
+
+    /* drop what wsd has not played: its read position jumps to our write position */
+    stream_command(stream, WSD_AUDIO_RESET);
+    stream->written_frames = 0;
+    stream->last_pos_frames = 0;
+    stream->held_frames = 0;
+    stream->lcl_offs_frames = 0;
+    stream->in_ring_frames = 0;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static void silence_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 frames)
+{
+    WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE*)stream->fmt;
+    if((stream->fmt->wFormatTag == WAVE_FORMAT_PCM ||
+            (stream->fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM))) &&
+            stream->fmt->wBitsPerSample == 8)
+        memset(buffer, 128, frames * stream->fmt->nBlockAlign);
+    else
+        memset(buffer, 0, frames * stream->fmt->nBlockAlign);
+}
+
+/* copy frames from the local buffer into the ring, at ring position ring_written */
+static void ring_put(struct sail_stream *stream, const BYTE *src, UINT32 frames)
+{
+    UINT32 block = stream->fmt->nBlockAlign;
+    while(frames){
+        UINT32 pos = stream->ring_written % stream->ring_frames;
+        UINT32 n = min(frames, stream->ring_frames - pos);
+        if(stream->mute)
+            silence_buffer(stream, stream->ring_data + (SIZE_T)pos * block, n);
+        else
+            memcpy(stream->ring_data + (SIZE_T)pos * block, src, (SIZE_T)n * block);
+        src += (SIZE_T)n * block;
+        frames -= n;
+        stream->ring_written += n;
+    }
+}
+
+static void sail_write_data(struct sail_stream *stream)
+{
+    UINT32 in_ring_frames, write_limit, write_offs_frames, new_frames, to_write_frames, space;
+    UINT64 read_frames;
+    SIZE_T advanced;
+
+    read_frames = atomic_load_explicit((_Atomic UINT64 *)&stream->ring->read_frames, memory_order_acquire);
+    if(read_frames > stream->ring_written) /* RESET raced with us: nothing is queued */
+        read_frames = stream->ring_written;
+    in_ring_frames = stream->ring_written - read_frames;
+
+    if(in_ring_frames > stream->in_ring_frames){
+        TRACE("Capping reported frames from %u to %u\n", in_ring_frames, stream->in_ring_frames);
+        in_ring_frames = stream->in_ring_frames;
+    }
+
+    /* keep about three periods queued in the ring, like the OSS driver keeps in the device */
+    write_limit = 0;
+    while(write_limit + in_ring_frames < stream->period_frames * 3)
+        write_limit += stream->period_frames;
+    space = stream->ring_frames - (stream->ring_written - read_frames);
+    write_limit = min(write_limit, space);
+
+    /*        vvvvvv - in_ring_frames
+     * [--xxxxxxxxxx]
+     *       [xxxxxxxxxx--]
+     *        ^^^^^^^^^^ - held_frames
+     *        ^ - lcl_offs_frames
+     */
+    advanced = stream->in_ring_frames - in_ring_frames;
+    if(advanced > stream->held_frames)
+        advanced = stream->held_frames;
+    stream->lcl_offs_frames += advanced;
+    stream->lcl_offs_frames %= stream->bufsize_frames;
+    stream->held_frames -= advanced;
+    stream->in_ring_frames = in_ring_frames;
+
+    if(write_limit == 0 || stream->held_frames == stream->in_ring_frames)
+        return;
+
+    write_offs_frames = (stream->lcl_offs_frames + stream->in_ring_frames) % stream->bufsize_frames;
+    new_frames = min(stream->held_frames - stream->in_ring_frames, write_limit);
+
+    to_write_frames = min(new_frames, stream->bufsize_frames - write_offs_frames);
+    ring_put(stream, stream->local_buffer + (SIZE_T)write_offs_frames * stream->fmt->nBlockAlign, to_write_frames);
+    if(new_frames > to_write_frames) /* wrapped: the rest is at the start of the local buffer */
+        ring_put(stream, stream->local_buffer, new_frames - to_write_frames);
+    stream->in_ring_frames += new_frames;
+
+    atomic_store_explicit((_Atomic UINT64 *)&stream->ring->write_frames, stream->ring_written, memory_order_release);
+}
+
+static NTSTATUS sail_timer_loop(void *args)
+{
+    struct timer_loop_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    LARGE_INTEGER delay, now, next;
+    int adjust;
+
+    sail_lock(stream);
+
+    delay.QuadPart = -stream->period;
+    NtQueryPerformanceCounter(&now, NULL);
+    next.QuadPart = now.QuadPart + stream->period;
+
+    while(!stream->please_quit){
+        if(stream->playing && stream->held_frames)
+            sail_write_data(stream);
+        if(stream->event)
+            NtSetEvent(stream->event, NULL);
+        sail_unlock(stream);
+
+        NtDelayExecution(FALSE, &delay);
+
+        sail_lock(stream);
+        NtQueryPerformanceCounter(&now, NULL);
+        adjust = next.QuadPart - now.QuadPart;
+        if(adjust > stream->period / 2)
+            adjust = stream->period / 2;
+        else if(adjust < -stream->period / 2)
+            adjust = -stream->period / 2;
+        delay.QuadPart = -(stream->period + adjust);
+        next.QuadPart += stream->period;
+    }
+
+    sail_unlock(stream);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_get_render_buffer(void *args)
+{
+    struct get_render_buffer_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT32 write_pos, frames = params->frames;
+    BYTE **data = params->data;
+    SIZE_T size;
+
+    sail_lock(stream);
+
+    if(stream->getbuf_last)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+
+    if(!frames)
+        return sail_unlock_result(stream, &params->result, S_OK);
+
+    if(stream->held_frames + frames > stream->bufsize_frames)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
+
+    write_pos =
+        (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
+    if(write_pos + frames > stream->bufsize_frames){
+        if(stream->tmp_buffer_frames < frames){
+            if(stream->tmp_buffer){
+                size = 0;
+                NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
+                stream->tmp_buffer = NULL;
+            }
+            size = frames * stream->fmt->nBlockAlign;
+            if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
+                                       &size, MEM_COMMIT, PAGE_READWRITE)){
+                stream->tmp_buffer_frames = 0;
+                return sail_unlock_result(stream, &params->result, E_OUTOFMEMORY);
+            }
+            stream->tmp_buffer_frames = frames;
+        }
+        *data = stream->tmp_buffer;
+        stream->getbuf_last = -frames;
+    }else{
+        *data = stream->local_buffer + write_pos * stream->fmt->nBlockAlign;
+        stream->getbuf_last = frames;
+    }
+
+    silence_buffer(stream, *data, frames);
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static void sail_wrap_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 written_frames)
+{
+    UINT32 write_offs_frames =
+        (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
+    UINT32 write_offs_bytes = write_offs_frames * stream->fmt->nBlockAlign;
+    UINT32 chunk_frames = stream->bufsize_frames - write_offs_frames;
+    UINT32 chunk_bytes = chunk_frames * stream->fmt->nBlockAlign;
+    UINT32 written_bytes = written_frames * stream->fmt->nBlockAlign;
+
+    if(written_bytes <= chunk_bytes){
+        memcpy(stream->local_buffer + write_offs_bytes, buffer, written_bytes);
+    }else{
+        memcpy(stream->local_buffer + write_offs_bytes, buffer, chunk_bytes);
+        memcpy(stream->local_buffer, buffer + chunk_bytes,
+                written_bytes - chunk_bytes);
+    }
+}
+
+static NTSTATUS sail_release_render_buffer(void *args)
+{
+    struct release_render_buffer_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT32 written_frames = params->written_frames;
+    UINT flags = params->flags;
+    BYTE *buffer;
+
+    sail_lock(stream);
+
+    if(!written_frames){
+        stream->getbuf_last = 0;
+        return sail_unlock_result(stream, &params->result, S_OK);
+    }
+
+    if(!stream->getbuf_last)
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+
+    if(written_frames > (stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
+
+    if(stream->getbuf_last >= 0)
+        buffer = stream->local_buffer + stream->fmt->nBlockAlign *
+          ((stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames);
+    else
+        buffer = stream->tmp_buffer;
+
+    if(flags & AUDCLNT_BUFFERFLAGS_SILENT)
+        silence_buffer(stream, buffer, written_frames);
+
+    if(stream->getbuf_last < 0)
+        sail_wrap_buffer(stream, buffer, written_frames);
+
+    stream->held_frames += written_frames;
+    stream->written_frames += written_frames;
+    stream->getbuf_last = 0;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_capture_buffer(void *args)
+{
+    struct get_capture_buffer_params *params = args;
+    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_release_capture_buffer(void *args)
+{
+    struct release_capture_buffer_params *params = args;
+    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_is_format_supported(void *args)
+{
+    struct is_format_supported_params *params = args;
+
+    params->result = params->flow == eRender ? check_format(params->share, params->fmt_in)
+                                             : AUDCLNT_E_DEVICE_INVALIDATED;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_get_mix_format(void *args)
+{
+    struct get_mix_format_params *params = args;
+    WAVEFORMATEXTENSIBLE *fmt = params->fmt;
+
+    if(params->flow != eRender){
+        params->result = params->flow == eCapture ? AUDCLNT_E_DEVICE_INVALIDATED : E_UNEXPECTED;
+        return STATUS_SUCCESS;
+    }
+
+    /* what a Mac (and most Windows machines) mix in: 32-bit float stereo at 48 kHz */
+    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt->Format.wBitsPerSample = 32;
+    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    fmt->Format.nChannels = 2;
+    fmt->Format.nSamplesPerSec = 48000;
+    fmt->dwChannelMask = get_channel_mask(fmt->Format.nChannels);
+    fmt->Format.nBlockAlign = (fmt->Format.wBitsPerSample * fmt->Format.nChannels) / 8;
+    fmt->Format.nAvgBytesPerSec = fmt->Format.nSamplesPerSec * fmt->Format.nBlockAlign;
+    fmt->Samples.wValidBitsPerSample = fmt->Format.wBitsPerSample;
+    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_get_device_period(void *args)
+{
+    struct get_device_period_params *params = args;
+
+    if (params->def_period)
+        *params->def_period = def_period;
+    if (params->min_period)
+        *params->min_period = min_period;
+
+    params->result = S_OK;
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_get_buffer_size(void *args)
+{
+    struct get_buffer_size_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    *params->frames = stream->bufsize_frames;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_latency(void *args)
+{
+    struct get_latency_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    /* pretend we process audio in Period chunks, so max latency includes
+     * the period time.  Some native machines add .6666ms in shared mode. */
+    *params->latency = stream->period + 6666;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_current_padding(void *args)
+{
+    struct get_current_padding_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    *params->padding = stream->held_frames;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_next_packet_size(void *args)
+{
+    struct get_next_packet_size_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT32 *frames = params->frames;
+
+    sail_lock(stream);
+
+    *frames = stream->held_frames < stream->period_frames ? 0 : stream->period_frames;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_frequency(void *args)
+{
+    struct get_frequency_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT64 *freq = params->freq;
+
+    sail_lock(stream);
+
+    if(stream->share == AUDCLNT_SHAREMODE_SHARED)
+        *freq = (UINT64)stream->fmt->nSamplesPerSec * stream->fmt->nBlockAlign;
+    else
+        *freq = stream->fmt->nSamplesPerSec;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_get_position(void *args)
+{
+    struct get_position_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT64 *pos = params->pos, *qpctime = params->qpctime;
+
+    if (params->device) {
+        FIXME("Device position reporting not implemented\n");
+        params->result = E_NOTIMPL;
+        return STATUS_SUCCESS;
+    }
+
+    sail_lock(stream);
+
+    /* held_frames still counts what wsd has not read from the ring: the difference is what was played */
+    *pos = stream->written_frames - stream->held_frames;
+    if(*pos < stream->last_pos_frames)
+        *pos = stream->last_pos_frames;
+
+    stream->last_pos_frames = *pos;
+
+    TRACE("returning: %s\n", wine_dbgstr_longlong(*pos));
+    if(stream->share == AUDCLNT_SHAREMODE_SHARED)
+        *pos *= stream->fmt->nBlockAlign;
+
+    if(qpctime){
+        LARGE_INTEGER stamp, freq;
+        NtQueryPerformanceCounter(&stamp, &freq);
+        *qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    }
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_set_volumes(void *args)
+{
+    struct set_volumes_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+    UINT16 i;
+
+    if (params->master_volume) {
+        for (i = 0; i < stream->fmt->nChannels; ++i) {
+            if (params->master_volume * params->volumes[i] * params->session_volumes[i] != 1.0f) {
+                FIXME("Volume control is not implemented\n");
+                break;
+            }
+        }
+    }
+
+    sail_lock(stream);
+    stream->mute = !params->master_volume;
+    sail_unlock(stream);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_set_event_handle(void *args)
+{
+    struct set_event_handle_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    if(!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
+        return sail_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED);
+
+    if (stream->event){
+        FIXME("called twice\n");
+        return sail_unlock_result(stream, &params->result, HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
+    }
+
+    stream->event = params->event;
+
+    return sail_unlock_result(stream, &params->result, S_OK);
+}
+
+static NTSTATUS sail_is_started(void *args)
+{
+    struct is_started_params *params = args;
+    struct sail_stream *stream = handle_get_stream(params->stream);
+
+    sail_lock(stream);
+
+    return sail_unlock_result(stream, &params->result, stream->playing ? S_OK : S_FALSE);
+}
+
+static NTSTATUS sail_get_prop_value(void *args)
+{
+    struct get_prop_value_params *params = args;
+
+    params->result = E_NOTIMPL;
+
+    return STATUS_SUCCESS;
+}
+
+/* No MIDI and no aux (mixer) devices: mmdevapi uses the selected audio driver for MIDI too. */
+static NTSTATUS sail_midi_init(void *args)
+{
+    struct midi_init_params *params = args;
+    *params->err = MMSYSERR_ERROR; /* DRV_LOAD fails: no MIDI notification thread */
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_midi_out_message(void *args)
+{
+    struct midi_out_message_params *params = args;
+    if (params->notify) params->notify->send_notify = FALSE;
+    *params->err = params->msg == MODM_GETNUMDEVS ? 0 : MMSYSERR_BADDEVICEID;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_midi_in_message(void *args)
+{
+    struct midi_in_message_params *params = args;
+    if (params->notify) params->notify->send_notify = FALSE;
+    *params->err = params->msg == MIDM_GETNUMDEVS ? 0 : MMSYSERR_BADDEVICEID;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_midi_notify_wait(void *args)
+{
+    struct midi_notify_wait_params *params = args;
+    *params->quit = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS sail_aux_message(void *args)
+{
+    struct aux_message_params *params = args;
+    *params->err = params->msg == AUXDM_GETNUMDEVS ? 0 : MMSYSERR_BADDEVICEID;
+    return STATUS_SUCCESS;
+}
+
+const unixlib_entry_t __wine_unix_call_funcs[] =
+{
+    sail_process_attach,
+    sail_not_implemented,
+    sail_main_loop,
+    sail_get_endpoint_ids,
+    sail_create_stream,
+    sail_release_stream,
+    sail_start,
+    sail_stop,
+    sail_reset,
+    sail_timer_loop,
+    sail_get_render_buffer,
+    sail_release_render_buffer,
+    sail_get_capture_buffer,
+    sail_release_capture_buffer,
+    sail_is_format_supported,
+    sail_not_implemented,
+    sail_get_mix_format,
+    sail_get_device_period,
+    sail_get_buffer_size,
+    sail_get_latency,
+    sail_get_current_padding,
+    sail_get_next_packet_size,
+    sail_get_frequency,
+    sail_get_position,
+    sail_set_volumes,
+    sail_set_event_handle,
+    sail_not_implemented,
+    sail_test_connect,
+    sail_is_started,
+    sail_get_prop_value,
+    sail_not_implemented,
+    sail_midi_init,
+    sail_not_implemented,
+    sail_midi_out_message,
+    sail_midi_in_message,
+    sail_midi_notify_wait,
+    sail_aux_message,
+};
+
+C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);

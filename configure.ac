@@ -1093,6 +1093,7 @@ dnl SailOver: the drivers of voile-lkd's Linux engine (wsd window server, Neptun
 case $host_os in
   linux*) ;;
   *)
+    enable_winesailaudio_drv=${enable_winesailaudio_drv:-no}
     enable_nptunix=${enable_nptunix:-no}
     enable_winesailover_drv=${enable_winesailover_drv:-no}
     ;;
@@ -3402,6 +3403,7 @@ WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)
 WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)
+WINE_CONFIG_MAKEFILE(dlls/winesailaudio.drv)
 WINE_CONFIG_MAKEFILE(dlls/winesailover.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
 WINE_CONFIG_MAKEFILE(dlls/winevulkan)
