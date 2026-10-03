@@ -535,13 +535,20 @@ static inline TEB *get_current_teb(void)
 }
 #endif
 
+/* The syscall stubs of include/wine/asm.h call through this address. It used to be the page right after
+ * KUSER_SHARED_DATA (7ffe1000); that page is MAP_SHARED with the wineserver while the pointer page is private
+ * and writable, and hosts with pages larger than 4 KiB cannot protect them differently inside one host page.
+ * The offset is therefore a multiple of the largest host page size (16 KiB) and lies inside the 64 KiB block
+ * that virtual_alloc_first_teb() reserves at user_shared_data. */
+#define USD_SYSCALL_DISPATCHER_OFFSET 0x4000
+
 extern void __wine_syscall_dispatcher_instrumentation(void);
 static void *instrumentation_callback;
 static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void set_process_instrumentation_callback( void *callback )
 {
-    void *ptr = (char *)user_shared_data + page_size;
+    void *ptr = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
     sigset_t sigset;
     void *old;
 
@@ -3004,8 +3011,8 @@ void signal_init_process(void)
 
     thread_data->syscall_frame = (struct syscall_frame *)(((ULONG_PTR)kernel_stack - frame_size) & ~(ULONG_PTR)63);
 
-    /* sneak in a syscall dispatcher pointer at a fixed address (7ffe1000) */
-    ptr = (char *)user_shared_data + page_size;
+    /* sneak in a syscall dispatcher pointer at a fixed address (7ffe4000, see USD_SYSCALL_DISPATCHER_OFFSET) */
+    ptr = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
     anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
     *(void **)ptr = __wine_syscall_dispatcher;
 

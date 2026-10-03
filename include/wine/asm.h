@@ -296,8 +296,8 @@
                        ".byte 0xc3\n\t"           /* 14: ret */ \
                        ".byte 0xeb,0x01\n\t"      /* 15: jmp 18 */ \
                        ".byte 0xc3\n\t"           /* 17: ret */ \
-                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe1000) */ \
-                       ".long 0x7ffe1000\n\t" \
+                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe4000) */ \
+                       ".long 0x7ffe4000\n\t" \
                        ".byte 0xc3" )             /* 1f: ret */
 #elif defined __arm__
 # define __ASM_SYSCALL_FUNC(id,name,args) \

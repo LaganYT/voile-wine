@@ -4063,9 +4063,20 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T block_size = signal_stack_mask + 1;
     SIZE_T total = 32 * block_size;
 
-    /* reserve space for shared user data */
-    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+    /* Reserve the whole 64 KiB allocation granularity block of the shared user data, like Windows does, and commit
+     * only its first page. The page is later remapped MAP_SHARED, and no other allocation may share a host page
+     * with it (SailOver: hosts whose pages are larger than 4 KiB cannot give a shared page and a private one
+     * different protections). */
+    {
+        void *usd_base = user_shared_data;
+        SIZE_T usd_size = 0x10000;
+
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &usd_base, 0, &usd_size,
+                                          MEM_RESERVE, PAGE_NOACCESS );
+        if (!status)
+            status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
+                                              MEM_COMMIT, PAGE_READONLY );
+    }
     if (status)
     {
         ERR( "wine: failed to map the shared user data: %08x\n", status );
@@ -4424,6 +4435,11 @@ void virtual_map_user_shared_data(void)
         ERR( "failed to open the USD section: %08x\n", status );
         exit(1);
     }
+    /* SailOver: with a host page larger than 4 KiB, mprotect_range() gave the whole host page the protection of
+     * the committed USD page; the other pages of that host page are reserved PAGE_NOACCESS, make them PROT_NONE
+     * again so that the host can map the 4 KiB shared page next to them. */
+    if (host_page_size > page_size)
+        anon_mmap_fixed( (char *)user_shared_data + page_size, host_page_size - page_size, PROT_NONE, 0 );
     if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
         (user_shared_data != mmap( user_shared_data, page_size, PROT_READ, MAP_SHARED|MAP_FIXED, fd, 0 )))
     {
