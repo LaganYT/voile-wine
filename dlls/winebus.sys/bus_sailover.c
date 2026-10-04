@@ -5,7 +5,9 @@
  * them on a UNIX socket, WINE_SAILOVER_INPUT_SOCKET or /run/sailover/input.sock by default. Each
  * gamepad becomes a HID gamepad with the layout of the SDL bus's mapped controllers, which
  * winexinput.sys offers through XInput; rumble goes back to the service. Wire format:
- * sailover_input_protocol.h. Without a service the bus does not start.
+ * sailover_input_protocol.h. Without the variable and without a service at the default place, the
+ * bus does not start. Otherwise it connects again every second while the service is missing: the
+ * service may start after Wine, or a server kept from a previous game may outlive its service.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -68,7 +70,9 @@ static pthread_mutex_t sailover_cs = PTHREAD_MUTEX_INITIALIZER;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
 
+static struct sockaddr_un service_addr;
 static int service_fd = -1;
+static BOOL service_incompatible;
 static int control_pipe[2] = {-1, -1};
 static BYTE message[sizeof(struct si_hdr) + SI_MAX_PAYLOAD];
 static size_t message_len;
@@ -308,6 +312,7 @@ static void process_message(const struct si_hdr *hdr, const BYTE *payload)
             ERR("input service speaks version %u, this bus %u\n", hello->version, SI_PROTOCOL_VERSION);
             close(service_fd);
             service_fd = -1;
+            service_incompatible = TRUE;
         }
         break;
     }
@@ -317,8 +322,9 @@ static void process_message(const struct si_hdr *hdr, const BYTE *payload)
     case SI_EV_REMOVED:
     {
         const struct si_gamepad *gamepad = (const struct si_gamepad *)payload;
-        if (hdr->len < sizeof(*gamepad)) break;
-        if ((impl = find_device(gamepad->gamepad_id))) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
+        if (hdr->len < sizeof(*gamepad) || !(impl = find_device(gamepad->gamepad_id))) break;
+        bus_event_queue_device_removed(&event_queue, &impl->unix_device);
+        impl->gamepad_id = 0; /* until it stops, matches no gamepad of the service */
         break;
     }
     case SI_EV_STATE:
@@ -353,7 +359,12 @@ static void read_service(void)
         close(service_fd);
         service_fd = -1;
         LIST_FOR_EACH_ENTRY(impl, &device_list, struct sailover_device, unix_device.entry)
+        {
+            /* a service started again numbers its gamepads from scratch */
+            if (!impl->gamepad_id) continue;
             bus_event_queue_device_removed(&event_queue, &impl->unix_device);
+            impl->gamepad_id = 0;
+        }
         pthread_mutex_unlock(&sailover_cs);
         return;
     }
@@ -382,56 +393,55 @@ static void read_service(void)
     pthread_mutex_unlock(&sailover_cs);
 }
 
-NTSTATUS sailover_bus_init(void *args)
+/* Connects to the service and greets it; sailover_cs must be held. */
+static void connect_service(void)
 {
-    struct sockaddr_un addr = {.sun_family = AF_UNIX};
     struct si_hello hello = {SI_PROTOCOL_VERSION, getpid()};
-    const char *path;
-    BOOL sent;
     int fd;
 
-    if (!(path = getenv("WINE_SAILOVER_INPUT_SOCKET"))) path = "/run/sailover/input.sock";
-    if (strlen(path) >= sizeof(addr.sun_path)) return STATUS_NOT_SUPPORTED;
-    strcpy(addr.sun_path, path);
-
-    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) return STATUS_UNSUCCESSFUL;
+    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) return;
     fcntl(fd, F_SETFD, FD_CLOEXEC);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        TRACE("no input service at %s: %s\n", path, strerror(errno));
-        close(fd);
-        return STATUS_NOT_SUPPORTED;
-    }
 #ifdef SO_NOSIGPIPE
     {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
     }
 #endif
-    if (pipe(control_pipe) < 0)
+    if (connect(fd, (struct sockaddr *)&service_addr, sizeof(service_addr)) < 0)
     {
         close(fd);
-        return STATUS_UNSUCCESSFUL;
+        return;
     }
+    service_fd = fd;
+    message_len = 0;
+    if (service_send(SI_HELLO, &hello, sizeof(hello)))
+    {
+        TRACE("connected to the input service at %s\n", service_addr.sun_path);
+        return;
+    }
+    close(fd);
+    service_fd = -1;
+}
+
+NTSTATUS sailover_bus_init(void *args)
+{
+    static const char linux_engine_path[] = "/run/sailover/input.sock";
+    const char *path = getenv("WINE_SAILOVER_INPUT_SOCKET");
+
+    if (!path && access(linux_engine_path, F_OK)) return STATUS_NOT_SUPPORTED;
+    if (!path) path = linux_engine_path;
+    if (strlen(path) >= sizeof(service_addr.sun_path)) return STATUS_NOT_SUPPORTED;
+    service_addr.sun_family = AF_UNIX;
+    strcpy(service_addr.sun_path, path);
+
+    if (pipe(control_pipe) < 0) return STATUS_UNSUCCESSFUL;
     fcntl(control_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(control_pipe[1], F_SETFD, FD_CLOEXEC);
 
     pthread_mutex_lock(&sailover_cs);
-    service_fd = fd;
-    message_len = 0;
-    sent = service_send(SI_HELLO, &hello, sizeof(hello));
+    connect_service();
     pthread_mutex_unlock(&sailover_cs);
-    if (!sent)
-    {
-        close(service_fd);
-        service_fd = -1;
-        close(control_pipe[0]);
-        close(control_pipe[1]);
-        control_pipe[0] = control_pipe[1] = -1;
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    TRACE("connected to the input service at %s\n", path);
+    if (service_fd < 0) TRACE("no input service at %s yet\n", path);
     return STATUS_SUCCESS;
 }
 
@@ -449,16 +459,25 @@ NTSTATUS sailover_bus_wait(void *args)
 
         fds[0].fd = control_pipe[0];
         fds[0].events = POLLIN;
-        fds[1].fd = service_fd; /* ignored once the service is gone */
+        fds[1].fd = service_fd; /* ignored while there is no service */
         fds[1].events = POLLIN;
-        if (poll(fds, 2, -1) < 0)
+        if (poll(fds, 2, service_fd < 0 && !service_incompatible ? 1000 : -1) < 0)
         {
             if (errno == EINTR) continue;
             ERR("poll failed: %s\n", strerror(errno));
             break;
         }
         if (fds[0].revents) break;
-        if (fds[1].revents) read_service();
+        if (service_fd >= 0)
+        {
+            if (fds[1].revents) read_service();
+        }
+        else if (!service_incompatible)
+        {
+            pthread_mutex_lock(&sailover_cs);
+            connect_service();
+            pthread_mutex_unlock(&sailover_cs);
+        }
     }
 
     TRACE("SailOver main loop exiting\n");

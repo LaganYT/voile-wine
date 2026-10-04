@@ -1319,9 +1319,9 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
 
         if (!sdl_driver_init()) options.disable_input = TRUE;
         udev_driver_init();
+        if (!sailover_driver_init()) options.sailover_gamepads = TRUE;
         iohid_driver_init();
         xbox_driver_init();
-        sailover_driver_init();
 
         irp->IoStatus.Status = STATUS_SUCCESS;
         break;

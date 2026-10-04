@@ -448,6 +448,7 @@ static NTSTATUS wow64_sdl_bus_init(void *args)
         BOOL disable_udevd;
         BOOL split_controllers;
         BOOL map_controllers;
+        BOOL sailover_gamepads;
         UINT mappings_count;
         PTR32 mappings;
     } const *params32 = args;
@@ -459,6 +460,7 @@ static NTSTATUS wow64_sdl_bus_init(void *args)
         params32->disable_udevd,
         params32->split_controllers,
         params32->map_controllers,
+        params32->sailover_gamepads,
         params32->mappings_count,
     };
     PTR32 *mappings = UlongToPtr(params32->mappings);

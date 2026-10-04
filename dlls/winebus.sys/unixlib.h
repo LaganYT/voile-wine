@@ -63,6 +63,7 @@ struct bus_options
     BOOL disable_udevd;
     BOOL split_controllers;
     BOOL map_controllers;
+    BOOL sailover_gamepads; /* the SailOver bus serves the gamepads */
     UINT mappings_count;
     struct list devices;
     char **mappings;
