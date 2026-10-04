@@ -924,6 +924,8 @@ struct bus_main_params
     unsigned int init_code;
     unsigned int wait_code;
     struct bus_event *bus_event;
+    /* the bus already chose how to present each device: no hidraw preference applies */
+    BOOL keep_devices;
 };
 
 static DWORD CALLBACK bus_main_thread(void *args)
@@ -961,7 +963,7 @@ static DWORD CALLBACK bus_main_thread(void *args)
             UINT buttons;
 
             usages = get_device_usages(event->device, &buttons);
-            if (!desc.is_hidraw != !is_hidraw_enabled(desc.vid, desc.pid, &usages, buttons))
+            if (!bus.keep_devices && !desc.is_hidraw != !is_hidraw_enabled(desc.vid, desc.pid, &usages, buttons))
             {
                 struct device_remove_params params = {.device = event->device};
                 WARN("ignoring %shidraw device %04x:%04x with usages %04x:%04x\n", desc.is_hidraw ? "" : "non-",
@@ -1286,6 +1288,19 @@ static NTSTATUS xbox_driver_init(void)
     return bus_main_thread_start(&bus);
 }
 
+static NTSTATUS sailover_driver_init(void)
+{
+    struct bus_main_params bus =
+    {
+        .name = L"SailOver",
+        .init_code = sailover_init,
+        .wait_code = sailover_wait,
+        .keep_devices = TRUE,
+    };
+
+    return bus_main_thread_start(&bus);
+}
+
 static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
 {
     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
@@ -1306,6 +1321,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         udev_driver_init();
         iohid_driver_init();
         xbox_driver_init();
+        sailover_driver_init();
 
         irp->IoStatus.Status = STATUS_SUCCESS;
         break;
@@ -1317,6 +1333,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         winebus_call(udev_stop, NULL);
         winebus_call(iohid_stop, NULL);
         winebus_call(xbox_stop, NULL);
+        winebus_call(sailover_stop, NULL);
 
         WaitForMultipleObjects(bus_count, bus_thread, TRUE, INFINITE);
         while (bus_count--) CloseHandle(bus_thread[bus_count]);
