@@ -276,7 +276,7 @@ void init_memory(void)
 {
     host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
     {
-        /* SailOver: same override as ntdll's virtual.c, for hosts whose hardware page is larger than the guest's */
+        /* Obelisk: same override as ntdll's virtual.c, for hosts whose hardware page is larger than the guest's */
         const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
         size_t size = env ? strtoul( env, NULL, 0 ) : 0;
         if (size > host_page_mask + 1 && size <= 0x10000 && !(size & (size - 1))) host_page_mask = size - 1;
@@ -663,7 +663,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
         {
             get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
             if (file_size > max_size) max_size = file_size;
-            /* SailOver: each shared section sits in the temp file at its own RVA (sparse file), so that file offset
+            /* Obelisk: each shared section sits in the temp file at its own RVA (sparse file), so that file offset
              * and address are congruent modulo any host page size (16 KiB hosts cannot mmap them otherwise) */
             total_size = max( total_size, (mem_size_t)sec[i].VirtualAddress + map_size );
         }
@@ -687,7 +687,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED)) continue;
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
         get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
-        write_pos = sec[i].VirtualAddress;  /* SailOver: see above */
+        write_pos = sec[i].VirtualAddress;  /* Obelisk: see above */
         shared_pos += map_size;
         if (!sec[i].PointerToRawData || !file_size) continue;
         toread = file_size;
@@ -1373,7 +1373,7 @@ struct mapping *create_session_mapping( struct object *root, const struct unicod
     static const unsigned int access = FILE_READ_DATA | FILE_WRITE_DATA;
     size_t size = max( sizeof(*shared_session) + sizeof(object_shm_t) * 512, 0x10000 );
 
-    /* SailOver: the session mapping is mapped MAP_SHARED by every client; keep its size and every growth step a
+    /* Obelisk: the session mapping is mapped MAP_SHARED by every client; keep its size and every growth step a
      * multiple of the 64 KiB allocation granularity so that no view of it ends inside a larger (16 KiB) host page
      * shared with a private allocation. */
     size = round_size( size, 0xffff );
@@ -1412,7 +1412,7 @@ static struct session_block *grow_session_mapping( mem_size_t needed )
     void *tmp;
 
     new_size = max( old_size * 3 / 2, old_size + max( needed, 0x10000 ) );
-    new_size = round_size( new_size, 0xffff );  /* SailOver: see create_session_mapping */
+    new_size = round_size( new_size, 0xffff );  /* Obelisk: see create_session_mapping */
     assert( new_size > old_size );
 
     unix_fd = get_unix_fd( session_mapping->fd );

@@ -2,7 +2,7 @@
 #pragma makedep unix
 #endif
 /*
- * Copyright 2026 SailOver
+ * Copyright 2026 Obelisk
  * SPDX-License-Identifier: MIT
  *
  * No virtio-gpu under LKD on macOS: every virtgpu entry fails, so the Neptune client takes its vtest transport.

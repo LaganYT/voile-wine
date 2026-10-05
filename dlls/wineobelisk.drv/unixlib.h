@@ -1,5 +1,5 @@
 /*
- * winesailover.drv PE/unix interface
+ * wineobelisk.drv PE/unix interface
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,21 +16,21 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#ifndef __WINE_SAILOVERDRV_UNIXLIB_H
-#define __WINE_SAILOVERDRV_UNIXLIB_H
+#ifndef __WINE_OBELISKDRV_UNIXLIB_H
+#define __WINE_OBELISKDRV_UNIXLIB_H
 
 #include "wine/unixlib.h"
 
-enum sailoverdrv_unix_func
+enum obeliskdrv_unix_func
 {
-    sailoverdrv_unix_func_init,
-    sailoverdrv_unix_func_read_events,
-    sailoverdrv_unix_func_set_app_icon,
-    sailoverdrv_unix_func_count,
+    obeliskdrv_unix_func_init,
+    obeliskdrv_unix_func_read_events,
+    obeliskdrv_unix_func_set_app_icon,
+    obeliskdrv_unix_func_count,
 };
 
-/* sailoverdrv_unix_func_set_app_icon */
-struct sailoverdrv_app_icon_params
+/* obeliskdrv_unix_func_set_app_icon */
+struct obeliskdrv_app_icon_params
 {
     UINT        width, height;
     const void *bits;  /* top-down BGRA, straight alpha, width * 4 bytes per row */

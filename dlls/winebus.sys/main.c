@@ -1288,13 +1288,13 @@ static NTSTATUS xbox_driver_init(void)
     return bus_main_thread_start(&bus);
 }
 
-static NTSTATUS sailover_driver_init(void)
+static NTSTATUS obelisk_driver_init(void)
 {
     struct bus_main_params bus =
     {
-        .name = L"SailOver",
-        .init_code = sailover_init,
-        .wait_code = sailover_wait,
+        .name = L"Obelisk",
+        .init_code = obelisk_init,
+        .wait_code = obelisk_wait,
         .keep_devices = TRUE,
     };
 
@@ -1319,7 +1319,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
 
         if (!sdl_driver_init()) options.disable_input = TRUE;
         udev_driver_init();
-        if (!sailover_driver_init()) options.sailover_gamepads = TRUE;
+        if (!obelisk_driver_init()) options.obelisk_gamepads = TRUE;
         iohid_driver_init();
         xbox_driver_init();
 
@@ -1333,7 +1333,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         winebus_call(udev_stop, NULL);
         winebus_call(iohid_stop, NULL);
         winebus_call(xbox_stop, NULL);
-        winebus_call(sailover_stop, NULL);
+        winebus_call(obelisk_stop, NULL);
 
         WaitForMultipleObjects(bus_count, bus_thread, TRUE, INFINITE);
         while (bus_count--) CloseHandle(bus_thread[bus_count]);

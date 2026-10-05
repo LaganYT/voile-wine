@@ -1,5 +1,5 @@
 /*
- * winesailover.drv unix side: user driver backed by the SailOver window server wsd
+ * wineobelisk.drv unix side: user driver backed by the Obelisk window server wsd
  *
  * One AF_UNIX connection per process. Top-level visible windows get a wsd window: a macOS titled window
  * (title bar and buttons drawn by macOS, like winemac.drv) when the Win32 window has a caption, a borderless
@@ -53,13 +53,13 @@
 #include "unixlib.h"
 #include "wsd_protocol.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(sailover);
+WINE_DEFAULT_DEBUG_CHANNEL(obelisk);
 
 #define SHM_ALIGN      0x4000  /* host page; wsd maps the whole fd */
 #define STRIDE_ALIGN   256     /* multiple of every Metal linear texture alignment */
 #define NB_BUFFERS     2
 
-struct sail_buffer
+struct obelisk_buffer
 {
     UINT  id;        /* wsd buffer id, 0 when unused */
     void *bits;
@@ -68,7 +68,7 @@ struct sail_buffer
     BOOL  busy;      /* presented, no EV_RELEASE yet */
 };
 
-struct sail_win
+struct obelisk_win
 {
     HWND  hwnd;      /* 0 when the slot is free */
     BOOL  created;   /* wsd window exists */
@@ -84,21 +84,21 @@ struct sail_win
     RECT  client;    /* client rect relative to the visible rect (window pixels) */
     BOOL  frame_pending;
     RECT  pending;   /* visible rect the user gave the macOS window, applied by the window's thread */
-    struct sail_buffer buffers[NB_BUFFERS];
+    struct obelisk_buffer buffers[NB_BUFFERS];
 };
 
-/* driver messages, handled by SAIL_WindowMessage in the window's thread */
-enum { WM_SAIL_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG };
+/* driver messages, handled by OBELISK_WindowMessage in the window's thread */
+enum { WM_OBELISK_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG };
 
 static int wsd_fd = -1;
 static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t win_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct sail_win windows[WSD_MAX_WINDOWS];
+static struct obelisk_win windows[WSD_MAX_WINDOWS];
 static UINT next_buffer_id = 1;
 static UINT64 present_serial;
 static struct wsd_hello_reply hello;
 static BOOL cursor_visible = TRUE;
-static const WCHAR sailover_window_propW[] = {'_','_','w','i','n','e','_','s','a','i','l','o','v','e','r','_','w','i','n','d','o','w',0};
+static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','s','a','i','l','o','v','e','r','_','w','i','n','d','o','w',0};
 static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
 static void (*presented_listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns );
 static BOOL debug_injected;
@@ -118,7 +118,7 @@ static void update_relative_mouse( UINT window_id )
         wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ want, 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
     TRACE( "relative mouse window %u -> %u\n", relative_window, want );
     relative_window = want;
-}  /* WINE_SAILOVER_DEBUG_INJECT already sent */
+}  /* WINE_OBELISK_DEBUG_INJECT already sent */
 
 static BOOL latency_trace;
 
@@ -213,22 +213,22 @@ static BOOL wsd_read( struct wsd_hdr *hdr, void *payload )
 /***********************************************************************
  *           window table (win_lock held)
  */
-static struct sail_win *get_win( HWND hwnd )
+static struct obelisk_win *get_win( HWND hwnd )
 {
     UINT i;
     for (i = 0; i < WSD_MAX_WINDOWS; i++) if (windows[i].hwnd == hwnd) return &windows[i];
     return NULL;
 }
 
-static struct sail_win *get_win_by_id( UINT id )
+static struct obelisk_win *get_win_by_id( UINT id )
 {
     if (!id || id > WSD_MAX_WINDOWS || !windows[id - 1].hwnd) return NULL;
     return &windows[id - 1];
 }
 
-static UINT win_id( struct sail_win *win ) { return win - windows + 1; }
+static UINT win_id( struct obelisk_win *win ) { return win - windows + 1; }
 
-static struct sail_win *alloc_win( HWND hwnd )
+static struct obelisk_win *alloc_win( HWND hwnd )
 {
     UINT i;
     for (i = 0; i < WSD_MAX_WINDOWS; i++)
@@ -242,7 +242,7 @@ static struct sail_win *alloc_win( HWND hwnd )
     return NULL;
 }
 
-static void free_buffer( struct sail_buffer *buf )
+static void free_buffer( struct obelisk_buffer *buf )
 {
     if (!buf->id) return;
     wsd_send( WSD_BUFFER_DETACH, &(struct wsd_buffer){ buf->id }, sizeof(struct wsd_buffer), NULL, 0, -1 );
@@ -250,7 +250,7 @@ static void free_buffer( struct sail_buffer *buf )
     memset( buf, 0, sizeof(*buf) );
 }
 
-static void destroy_win( struct sail_win *win )
+static void destroy_win( struct obelisk_win *win )
 {
     UINT i;
     for (i = 0; i < NB_BUFFERS; i++) free_buffer( &win->buffers[i] );
@@ -278,7 +278,7 @@ static UINT frame_style( UINT style, UINT ex_style )
 }
 
 /* creates a shared memory buffer and attaches it in wsd */
-static BOOL alloc_buffer( struct sail_buffer *buf, UINT width, UINT height )
+static BOOL alloc_buffer( struct obelisk_buffer *buf, UINT width, UINT height )
 {
     UINT stride = (width * 4 + STRIDE_ALIGN - 1) & ~(STRIDE_ALIGN - 1);
     size_t size = ((size_t)stride * height + SHM_ALIGN - 1) & ~(size_t)(SHM_ALIGN - 1);
@@ -327,19 +327,19 @@ static BOOL alloc_buffer( struct sail_buffer *buf, UINT width, UINT height )
 /***********************************************************************
  *           window surface
  */
-static void sail_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+static void obelisk_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
 {
 }
 
-static BOOL sail_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+static BOOL obelisk_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
                                 const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                                 const BITMAPINFO *shape_info, const void *shape_bits )
 {
     UINT surf_width = color_info->bmiHeader.biWidth, surf_height = abs( color_info->bmiHeader.biHeight );
     UINT src_stride = surf_width * 4, width, height, y, i;
     int x0, y0;
-    struct sail_buffer *buf = NULL;
-    struct sail_win *win;
+    struct obelisk_buffer *buf = NULL;
+    struct obelisk_win *win;
     struct wsd_present present;
     BOOL ret = FALSE;
 
@@ -357,7 +357,7 @@ static BOOL sail_surface_flush( struct window_surface *surface, const RECT *rect
 
     for (i = 0; i < NB_BUFFERS; i++)
     {
-        struct sail_buffer *b = &win->buffers[i];
+        struct obelisk_buffer *b = &win->buffers[i];
         if (b->id && (b->width != width || b->height != height) && !b->busy) free_buffer( b );
         if (!b->id && !alloc_buffer( b, width, height )) goto done;
         if (!b->busy && b->width == width && b->height == height) { buf = b; break; }
@@ -376,7 +376,7 @@ static BOOL sail_surface_flush( struct window_surface *surface, const RECT *rect
     present.client_time_ns = now_ns();
     buf->busy = TRUE;
     if (!(ret = wsd_send( WSD_PRESENT, &present, sizeof(present), NULL, 0, -1 ))) buf->busy = FALSE;
-    if (ret && !debug_injected && getenv( "WINE_SAILOVER_DEBUG_INJECT" ))
+    if (ret && !debug_injected && getenv( "WINE_OBELISK_DEBUG_INJECT" ))
     {
         /* test only, once per process: wsd feeds synthetic key, button and motion events to this window */
         debug_injected = TRUE;
@@ -387,25 +387,25 @@ done:
     return ret;
 }
 
-static void sail_surface_destroy( struct window_surface *surface )
+static void obelisk_surface_destroy( struct window_surface *surface )
 {
 }
 
-static const struct window_surface_funcs sail_surface_funcs =
+static const struct window_surface_funcs obelisk_surface_funcs =
 {
-    sail_surface_set_clip,
-    sail_surface_flush,
-    sail_surface_destroy
+    obelisk_surface_set_clip,
+    obelisk_surface_flush,
+    obelisk_surface_destroy
 };
 
-static BOOL SAIL_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
+static BOOL OBELISK_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
 {
     char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     int width = surface_rect->right - surface_rect->left, height = surface_rect->bottom - surface_rect->top;
     struct window_surface *previous;
 
-    if ((previous = *surface) && previous->funcs == &sail_surface_funcs) return TRUE;
+    if ((previous = *surface) && previous->funcs == &obelisk_surface_funcs) return TRUE;
     if (!is_toplevel( hwnd )) return TRUE;  /* default surface */
     if (previous) window_surface_release( previous );
 
@@ -417,7 +417,7 @@ static BOOL SAIL_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfa
     info->bmiHeader.biBitCount    = 32;
     info->bmiHeader.biSizeImage   = width * height * 4;
     info->bmiHeader.biCompression = BI_RGB;
-    *surface = window_surface_create( sizeof(struct window_surface), &sail_surface_funcs, hwnd, surface_rect, info, 0 );
+    *surface = window_surface_create( sizeof(struct window_surface), &obelisk_surface_funcs, hwnd, surface_rect, info, 0 );
     TRACE( "hwnd %p rect %s surface %p\n", hwnd, wine_dbgstr_rect( surface_rect ), *surface );
     return TRUE;
 }
@@ -425,13 +425,13 @@ static BOOL SAIL_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfa
 /***********************************************************************
  *           window management
  */
-static BOOL SAIL_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
+static BOOL OBELISK_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
 {
     return is_toplevel( hwnd );  /* top-level windows get a driver surface */
 }
 
 /* The caption and borders macOS draws for a titled window: win32u leaves them out of the visible rect. */
-static BOOL SAIL_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask )
+static BOOL OBELISK_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask )
 {
     if (!(frame_style( style, ex_style ) & WSD_STYLE_TITLED)) return FALSE;
     *style_mask = WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
@@ -439,7 +439,7 @@ static BOOL SAIL_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT
     return TRUE;
 }
 
-static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                    const struct window_rects *rects, struct window_surface *surface )
 {
     DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE ), ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
@@ -448,7 +448,7 @@ static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
     UINT width = rects->visible.right - rects->visible.left, height = rects->visible.bottom - rects->visible.top;
     UINT frame = frame_style( style, ex_style );
-    struct sail_win *win;
+    struct obelisk_win *win;
 
     if (!is_toplevel( hwnd )) return;
     TRACE( "hwnd %p rects %s flags %08x visible %u fullscreen %u\n", hwnd, debugstr_window_rects( rects ),
@@ -513,7 +513,7 @@ static void SAIL_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
         win->created = TRUE;
         win->style = frame;
         /* nptunix (Neptune D3D presentation) finds the wsd window of a HWND through this property */
-        NtUserSetProp( hwnd, sailover_window_propW, ULongToHandle( win_id( win ) ));
+        NtUserSetProp( hwnd, obelisk_window_propW, ULongToHandle( win_id( win ) ));
         win->width = width;
         win->height = height;
         win->x = rects->visible.left;
@@ -541,7 +541,7 @@ done:
 static void apply_frame( HWND hwnd )
 {
     UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-    struct sail_win *win;
+    struct obelisk_win *win;
     RECT rect;
 
     pthread_mutex_lock( &win_lock );
@@ -570,11 +570,11 @@ static void apply_frame( HWND hwnd )
     NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags );
 }
 
-static LRESULT SAIL_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+static LRESULT OBELISK_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     switch (msg)
     {
-    case WM_SAIL_APPLY_FRAME:
+    case WM_OBELISK_APPLY_FRAME:
         apply_frame( hwnd );
         return 0;
     }
@@ -582,20 +582,20 @@ static LRESULT SAIL_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     return 0;
 }
 
-static void SAIL_DestroyWindow( HWND hwnd )
+static void OBELISK_DestroyWindow( HWND hwnd )
 {
-    struct sail_win *win;
+    struct obelisk_win *win;
 
-    NtUserRemoveProp( hwnd, sailover_window_propW );
+    NtUserRemoveProp( hwnd, obelisk_window_propW );
 
     pthread_mutex_lock( &win_lock );
     if ((win = get_win( hwnd ))) destroy_win( win );
     pthread_mutex_unlock( &win_lock );
 }
 
-static void SAIL_SetWindowText( HWND hwnd, LPCWSTR text )
+static void OBELISK_SetWindowText( HWND hwnd, LPCWSTR text )
 {
-    struct sail_win *win;
+    struct obelisk_win *win;
     char title[1024];
     DWORD len = 0;
 
@@ -609,14 +609,14 @@ static void SAIL_SetWindowText( HWND hwnd, LPCWSTR text )
 /***********************************************************************
  *           cursor
  */
-static void SAIL_SetCursor( HWND hwnd, HCURSOR cursor )
+static void OBELISK_SetCursor( HWND hwnd, HCURSOR cursor )
 {
     BOOL visible = cursor != 0;
     if (visible == cursor_visible) return;
     cursor_visible = visible;
     wsd_send( WSD_CURSOR_VISIBLE, &(struct wsd_window_flag){ 0, visible }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
     {
-        struct sail_win *win;
+        struct obelisk_win *win;
         UINT id = 0;
         pthread_mutex_lock( &win_lock );
         if ((win = get_win( NtUserGetForegroundWindow() )) && win->created) id = win_id( win );
@@ -625,11 +625,11 @@ static void SAIL_SetCursor( HWND hwnd, HCURSOR cursor )
     }
 }
 
-static BOOL SAIL_ClipCursor( const RECT *clip, BOOL reset )
+static BOOL OBELISK_ClipCursor( const RECT *clip, BOOL reset )
 {
     HWND foreground = NtUserGetForegroundWindow();
     struct wsd_cursor_clip req = { 0 };
-    struct sail_win *win;
+    struct obelisk_win *win;
 
     pthread_mutex_lock( &win_lock );
     if (!(win = get_win( foreground )) || !win->created)
@@ -664,7 +664,7 @@ static BOOL SAIL_ClipCursor( const RECT *clip, BOOL reset )
 /***********************************************************************
  *           display devices
  */
-static UINT SAIL_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
 {
     static const struct { UINT w, h; } extra[] = { {640,480}, {800,600}, {1024,768}, {1280,720}, {1280,800},
                                                      {1600,900}, {1920,1080}, {2560,1440} };
@@ -762,7 +762,7 @@ static void send_mouse( HWND hwnd, DWORD flags, int x, int y, DWORD data )
 static void handle_event( const struct wsd_hdr *hdr, const char *payload )
 {
     const struct wsd_window *w = (const struct wsd_window *)payload;
-    struct sail_win *win = NULL;
+    struct obelisk_win *win = NULL;
     HWND hwnd = 0;
     RECT visible = { 0 };
 
@@ -806,7 +806,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         if (hwnd) send_key( hwnd, ev );
         /* guest CLOCK_MONOTONIC is the host CLOCK_UPTIME_RAW under LKD, so these are comparable to wsd times */
         if (latency_trace)
-            fprintf( stderr, "winesailover latency: key %#x %s event %llu read +%.3f ms sent +%.3f ms\n",
+            fprintf( stderr, "wineobelisk latency: key %#x %s event %llu read +%.3f ms sent +%.3f ms\n",
                      ev->mac_keycode, (ev->flags & WSD_KEY_DOWN) ? "down" : "up", (unsigned long long)ev->time_ns,
                      (rx - ev->time_ns) / 1e6, (now_ns() - ev->time_ns) / 1e6 );
         break;
@@ -875,7 +875,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
             win->frame_pending = TRUE;
         }
         pthread_mutex_unlock( &win_lock );
-        if (hwnd && post) NtUserPostMessage( hwnd, WM_SAIL_APPLY_FRAME, 0, 0 );
+        if (hwnd && post) NtUserPostMessage( hwnd, WM_OBELISK_APPLY_FRAME, 0, 0 );
         break;
     }
     case WSD_EV_MINIMIZE:
@@ -920,30 +920,30 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
 /***********************************************************************
  *           API for other unix libraries of the process (nptunix.so, Neptune D3D presentation)
  *
- * Found with dlopen( "winesailover.so", RTLD_NOLOAD ) + dlsym. Buffer ids with bit 31 set belong to the caller;
+ * Found with dlopen( "wineobelisk.so", RTLD_NOLOAD ) + dlsym. Buffer ids with bit 31 set belong to the caller;
  * their EV_RELEASE events go to the listener (called on the event thread).
  */
-#define SAILOVER_EXPORT __attribute__((visibility("default")))
+#define OBELISK_EXPORT __attribute__((visibility("default")))
 
-SAILOVER_EXPORT BOOL sailover_wsd_send( UINT type, const void *payload, UINT len, int fd )
+OBELISK_EXPORT BOOL obelisk_wsd_send( UINT type, const void *payload, UINT len, int fd )
 {
     return wsd_send( type, payload, len, NULL, 0, fd );
 }
 
-SAILOVER_EXPORT void sailover_wsd_set_release_listener( void (*listener)( UINT buffer_id, UINT shown, UINT64 serial ) )
+OBELISK_EXPORT void obelisk_wsd_set_release_listener( void (*listener)( UINT buffer_id, UINT shown, UINT64 serial ) )
 {
     release_listener = listener;
 }
 
-SAILOVER_EXPORT void sailover_wsd_set_presented_listener( void (*listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns ) )
+OBELISK_EXPORT void obelisk_wsd_set_presented_listener( void (*listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns ) )
 {
     presented_listener = listener;
 }
 
 /* client area of a wsd window, in window pixels (top-left of the window's visible rect) */
-SAILOVER_EXPORT BOOL sailover_wsd_client_rect( UINT window_id, int *x, int *y, UINT *width, UINT *height )
+OBELISK_EXPORT BOOL obelisk_wsd_client_rect( UINT window_id, int *x, int *y, UINT *width, UINT *height )
 {
-    struct sail_win *win;
+    struct obelisk_win *win;
     BOOL ret = FALSE;
     pthread_mutex_lock( &win_lock );
     if ((win = get_win_by_id( window_id )) && win->client.right > win->client.left && win->client.bottom > win->client.top)
@@ -958,15 +958,15 @@ SAILOVER_EXPORT BOOL sailover_wsd_client_rect( UINT window_id, int *x, int *y, U
     return ret;
 }
 
-SAILOVER_EXPORT void sailover_wsd_set_external( UINT window_id, BOOL external )
+OBELISK_EXPORT void obelisk_wsd_set_external( UINT window_id, BOOL external )
 {
-    struct sail_win *win;
+    struct obelisk_win *win;
     pthread_mutex_lock( &win_lock );
     if ((win = get_win_by_id( window_id ))) win->external = external;
     pthread_mutex_unlock( &win_lock );
 }
 
-SAILOVER_EXPORT BOOL sailover_wsd_get_display( UINT *width, UINT *height, UINT *refresh_hz )
+OBELISK_EXPORT BOOL obelisk_wsd_get_display( UINT *width, UINT *height, UINT *refresh_hz )
 {
     if (!hello.display_width_px) return FALSE;
     *width = hello.display_width_px;
@@ -975,7 +975,7 @@ SAILOVER_EXPORT BOOL sailover_wsd_get_display( UINT *width, UINT *height, UINT *
     return TRUE;
 }
 
-SAILOVER_EXPORT UINT64 sailover_wsd_next_serial(void)
+OBELISK_EXPORT UINT64 obelisk_wsd_next_serial(void)
 {
     return __atomic_add_fetch( &present_serial, 1, __ATOMIC_SEQ_CST );
 }
@@ -983,29 +983,29 @@ SAILOVER_EXPORT UINT64 sailover_wsd_next_serial(void)
 /***********************************************************************
  *           unix calls
  */
-static const struct user_driver_funcs sailoverdrv_funcs =
+static const struct user_driver_funcs obeliskdrv_funcs =
 {
-    .pClipCursor = SAIL_ClipCursor,
-    .pCreateWindowSurface = SAIL_CreateWindowSurface,
-    .pDestroyWindow = SAIL_DestroyWindow,
-    .pGetWindowStyleMasks = SAIL_GetWindowStyleMasks,
-    .pSetCursor = SAIL_SetCursor,
-    .pSetWindowText = SAIL_SetWindowText,
-    .pUpdateDisplayDevices = SAIL_UpdateDisplayDevices,
-    .pWindowMessage = SAIL_WindowMessage,
-    .pWindowPosChanged = SAIL_WindowPosChanged,
-    .pWindowPosChanging = SAIL_WindowPosChanging,
+    .pClipCursor = OBELISK_ClipCursor,
+    .pCreateWindowSurface = OBELISK_CreateWindowSurface,
+    .pDestroyWindow = OBELISK_DestroyWindow,
+    .pGetWindowStyleMasks = OBELISK_GetWindowStyleMasks,
+    .pSetCursor = OBELISK_SetCursor,
+    .pSetWindowText = OBELISK_SetWindowText,
+    .pUpdateDisplayDevices = OBELISK_UpdateDisplayDevices,
+    .pWindowMessage = OBELISK_WindowMessage,
+    .pWindowPosChanged = OBELISK_WindowPosChanged,
+    .pWindowPosChanging = OBELISK_WindowPosChanging,
 };
 
-static NTSTATUS sailoverdrv_init( void *arg )
+static NTSTATUS obeliskdrv_init( void *arg )
 {
-    const char *path = getenv( "WINE_SAILOVER_SOCKET" );
+    const char *path = getenv( "WINE_OBELISK_SOCKET" );
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     struct wsd_hello req = { WSD_PROTOCOL_VERSION, getpid() };
     char payload[WSD_MAX_PAYLOAD];
     struct wsd_hdr hdr;
 
-    if (!path) path = "/run/sailover/wsd.sock";
+    if (!path) path = "/run/obelisk/wsd.sock";
     if (strlen( path ) >= sizeof(addr.sun_path)) return STATUS_UNSUCCESSFUL;
     strcpy( addr.sun_path, path );
     if ((wsd_fd = socket( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0 )) < 0) return STATUS_UNSUCCESSFUL;
@@ -1022,7 +1022,7 @@ static NTSTATUS sailoverdrv_init( void *arg )
     memcpy( &hello, payload, min( hdr.len, sizeof(hello) ));
     TRACE( "wsd pid %u display %ux%u @%u Hz scale %u/1000\n", hello.server_pid, hello.display_width_px,
            hello.display_height_px, hello.max_refresh_hz, hello.backing_scale_x1000 );
-    __wine_set_user_driver( &sailoverdrv_funcs, WINE_GDI_DRIVER_VERSION );
+    __wine_set_user_driver( &obeliskdrv_funcs, WINE_GDI_DRIVER_VERSION );
     return STATUS_SUCCESS;
 
 fail:
@@ -1031,21 +1031,21 @@ fail:
     return STATUS_UNSUCCESSFUL;
 }
 
-static NTSTATUS sailoverdrv_read_events( void *arg )
+static NTSTATUS obeliskdrv_read_events( void *arg )
 {
     char payload[WSD_MAX_PAYLOAD];
     struct wsd_hdr hdr;
 
-    latency_trace = getenv( "WINE_SAILOVER_LATENCY" ) != NULL;
+    latency_trace = getenv( "WINE_OBELISK_LATENCY" ) != NULL;
 
     while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
     return STATUS_UNSUCCESSFUL;
 }
 
 /* the program's icon becomes the Dock and Cmd-Tab icon */
-static NTSTATUS sailoverdrv_set_app_icon( void *arg )
+static NTSTATUS obeliskdrv_set_app_icon( void *arg )
 {
-    const struct sailoverdrv_app_icon_params *params = arg;
+    const struct obeliskdrv_app_icon_params *params = arg;
     struct wsd_app_icon icon = { params->width, params->height, params->width * 4 };
     size_t size = (size_t)icon.stride * icon.height;
     size_t map_size = (size + SHM_ALIGN - 1) & ~(size_t)(SHM_ALIGN - 1);
@@ -1073,9 +1073,9 @@ static NTSTATUS sailoverdrv_set_app_icon( void *arg )
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
-    sailoverdrv_init,
-    sailoverdrv_read_events,
-    sailoverdrv_set_app_icon,
+    obeliskdrv_init,
+    obeliskdrv_read_events,
+    obeliskdrv_set_app_icon,
 };
 
-C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == sailoverdrv_unix_func_count );
+C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == obeliskdrv_unix_func_count );

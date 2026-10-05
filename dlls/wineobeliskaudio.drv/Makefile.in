@@ -1,0 +1,7 @@
+MODULE    = wineobeliskaudio.drv
+UNIXLIB   = wineobeliskaudio.so
+IMPORTS   = uuid ole32 user32 advapi32
+UNIX_LIBS = $(PTHREAD_LIBS)
+
+SOURCES = \
+	obeliskaudio.c

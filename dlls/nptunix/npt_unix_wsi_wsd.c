@@ -3,15 +3,15 @@
 #endif
 /*
  * Copyright 2026 Turing Software LLC
- * Copyright 2026 SailOver
+ * Copyright 2026 Obelisk
  * SPDX-License-Identifier: MIT
  *
  * wsd WSI for nptunix.so: replaces the X11 DRI3/Present WSI (npt_unix_wsi.c). Each swapchain image is a host
  * blob (POSIX shm created by the macOS renderer, received through vtest); its fd is attached once to the wsd
  * window of the HWND with BUFFER_ATTACH, so wsd samples the pages DXMT rendered into (no copy). The wsd
- * connection is the one of winesailover.drv in the same process, reached through its exported functions.
+ * connection is the one of wineobelisk.drv in the same process, reached through its exported functions.
  * The x11_window field of npt_unix_wsi_init_params carries the wsd window id (HWND property
- * __wine_sailover_window, set by the display driver).
+ * __wine_obelisk_window, set by the display driver).
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -68,18 +68,18 @@ static bool bind_driver(void)
 {
    void *h;
    if (p_send) return true;
-   if (!(h = dlopen("winesailover.so", RTLD_NOW | RTLD_NOLOAD))) {
-      fprintf(stderr, "neptune unixlib wsi (wsd): winesailover.so is not loaded (%s)\n", dlerror());
+   if (!(h = dlopen("wineobelisk.so", RTLD_NOW | RTLD_NOLOAD))) {
+      fprintf(stderr, "neptune unixlib wsi (wsd): wineobelisk.so is not loaded (%s)\n", dlerror());
       return false;
    }
-   p_set_release_listener = dlsym(h, "sailover_wsd_set_release_listener");
-   p_set_external = dlsym(h, "sailover_wsd_set_external");
-   p_next_serial = dlsym(h, "sailover_wsd_next_serial");
-   p_set_presented_listener = dlsym(h, "sailover_wsd_set_presented_listener");
-   p_client_rect = dlsym(h, "sailover_wsd_client_rect");
-   p_send = dlsym(h, "sailover_wsd_send");
+   p_set_release_listener = dlsym(h, "obelisk_wsd_set_release_listener");
+   p_set_external = dlsym(h, "obelisk_wsd_set_external");
+   p_next_serial = dlsym(h, "obelisk_wsd_next_serial");
+   p_set_presented_listener = dlsym(h, "obelisk_wsd_set_presented_listener");
+   p_client_rect = dlsym(h, "obelisk_wsd_client_rect");
+   p_send = dlsym(h, "obelisk_wsd_send");
    if (!p_send || !p_set_release_listener || !p_set_external || !p_next_serial || !p_set_presented_listener || !p_client_rect) {
-      fprintf(stderr, "neptune unixlib wsi (wsd): winesailover.so lacks the wsd API\n");
+      fprintf(stderr, "neptune unixlib wsi (wsd): wineobelisk.so lacks the wsd API\n");
       p_send = NULL;
       return false;
    }

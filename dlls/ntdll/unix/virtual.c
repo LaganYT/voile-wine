@@ -174,7 +174,7 @@ static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
 static const UINT_PTR granularity_mask = 0xffff;
 
-/* SailOver: an x86-64 Linux guest under FEXCore/LKD sees 4 KiB pages, but the hardware page is 16 KiB and its
+/* Obelisk: an x86-64 Linux guest under FEXCore/LKD sees 4 KiB pages, but the hardware page is 16 KiB and its
  * protection is the union of its 4 KiB pages. WINE_HOST_PAGE_SIZE=16384 makes Wine use its large host page code
  * (written for 16 KiB arm64 kernels) for guard pages, stacks, write watches and file mappings. */
 #if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
@@ -2366,7 +2366,7 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     {
         /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
          * but they are on Linux so we take advantage of it.
-         * SailOver: not under LKD (Linux syscalls served on macOS), where a read-only MAP_PRIVATE file mapping is a
+         * Obelisk: not under LKD (Linux syscalls served on macOS), where a read-only MAP_PRIVATE file mapping is a
          * snapshot; shared session/queue objects written by wineserver would go stale. Use the portable path. */
 #if defined(__linux__) && !defined(WINE_VARIABLE_HOST_PAGE)
         flags |= MAP_PRIVATE;
@@ -2791,7 +2791,7 @@ static void *get_host_addr_space_limit(void)
         addr >>= 1;
     }
 #ifdef __linux__
-    /* SailOver: the limit is not always a power of two (an emulated address space ends at 0x7ffffe000000, for
+    /* Obelisk: the limit is not always a power of two (an emulated address space ends at 0x7ffffe000000, for
      * instance): find it to 64 KiB within [addr, addr * 2) instead of letting allocations retry above it. */
     {
         UINT_PTR lo = addr, hi = addr << 1;
@@ -3156,7 +3156,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
             (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
         {
-            pos = sec[i].VirtualAddress;  /* SailOver: the server stores each shared section at its RVA */
+            pos = sec[i].VirtualAddress;  /* Obelisk: the server stores each shared section at its RVA */
             TRACE_(module)( "%s mapping shared section %.8s at %p off %x (%x) size %lx (%lx) flags %x\n",
                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
@@ -4087,7 +4087,7 @@ TEB *virtual_alloc_first_teb(void)
 
     /* Reserve the whole 64 KiB allocation granularity block of the shared user data, like Windows does, and commit
      * only its first page. The page is later remapped MAP_SHARED, and no other allocation may share a host page
-     * with it (SailOver: hosts whose pages are larger than 4 KiB cannot give a shared page and a private one
+     * with it (Obelisk: hosts whose pages are larger than 4 KiB cannot give a shared page and a private one
      * different protections). */
     {
         void *usd_base = user_shared_data;
@@ -4457,7 +4457,7 @@ void virtual_map_user_shared_data(void)
         ERR( "failed to open the USD section: %08x\n", status );
         exit(1);
     }
-    /* SailOver: with a host page larger than 4 KiB, mprotect_range() gave the whole host page the protection of
+    /* Obelisk: with a host page larger than 4 KiB, mprotect_range() gave the whole host page the protection of
      * the committed USD page; the other pages of that host page are reserved PAGE_NOACCESS, make them PROT_NONE
      * again so that the host can map the 4 KiB shared page next to them. */
     if (host_page_size > page_size)

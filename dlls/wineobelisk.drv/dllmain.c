@@ -1,7 +1,7 @@
 /*
- * winesailover.drv entry points (PE side)
+ * wineobelisk.drv entry points (PE side)
  *
- * The display driver of SailOver: windows live in the native window server wsd (macOS), reached
+ * The display driver of Obelisk: windows live in the native window server wsd (macOS), reached
  * through an AF_UNIX socket. See voile-lkd wsd/PROTOCOL.md.
  *
  * This library is free software; you can redistribute it and/or
@@ -29,7 +29,7 @@
 #include "unixlib.h"
 #include "wine/debug.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(sailover);
+WINE_DEFAULT_DEBUG_CHANNEL(obelisk);
 
 static BOOL CALLBACK load_first_icon( HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR param )
 {
@@ -41,7 +41,7 @@ static BOOL CALLBACK load_first_icon( HMODULE module, LPCWSTR type, LPWSTR name,
  * the icon is the game's. */
 static void send_app_icon(void)
 {
-    struct sailoverdrv_app_icon_params params;
+    struct obeliskdrv_app_icon_params params;
     WCHAR path[MAX_PATH], windows[MAX_PATH];
     BITMAPINFO info = {{ sizeof(BITMAPINFOHEADER) }};
     UINT len = GetWindowsDirectoryW( windows, ARRAY_SIZE(windows) ), count, i;
@@ -80,7 +80,7 @@ static void send_app_icon(void)
             params.width = bm.bmWidth;
             params.height = bm.bmHeight;
             params.bits = bits;
-            if (WINE_UNIX_CALL( sailoverdrv_unix_func_set_app_icon, &params ))
+            if (WINE_UNIX_CALL( obeliskdrv_unix_func_set_app_icon, &params ))
                 WARN( "the window server refused the program's icon\n" );
         }
         DeleteDC( hdc );
@@ -96,7 +96,7 @@ static void send_app_icon(void)
 static DWORD WINAPI read_events_thread( void *arg )
 {
     send_app_icon();
-    WINE_UNIX_CALL( sailoverdrv_unix_func_read_events, NULL );
+    WINE_UNIX_CALL( obeliskdrv_unix_func_read_events, NULL );
     ERR( "lost the connection to the window server wsd\n" );
     return 0;
 }
@@ -108,7 +108,7 @@ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
     DisableThreadLibraryCalls( instance );
     if (__wine_init_unix_call()) return FALSE;
-    if (WINE_UNIX_CALL( sailoverdrv_unix_func_init, NULL )) return FALSE;
+    if (WINE_UNIX_CALL( obeliskdrv_unix_func_init, NULL )) return FALSE;
     CloseHandle( CreateThread( NULL, 0, read_events_thread, NULL, 0, &tid ));
     return TRUE;
 }

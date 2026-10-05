@@ -2,10 +2,10 @@
 #pragma makedep unix
 #endif
 /*
- * Copyright 2026 SailOver
+ * Copyright 2026 Obelisk
  * SPDX-License-Identifier: MIT
  *
- * DXGI outputs from the wsd window server (main screen of EV_HELLO, through winesailover.so) instead of DRM KMS.
+ * DXGI outputs from the wsd window server (main screen of EV_HELLO, through wineobelisk.so) instead of DRM KMS.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -25,8 +25,8 @@ bool npt_enumerate_outputs(struct npt_output_list *list, bool expose_all_modes)
    void *h;
 
    (void)expose_all_modes;
-   if (!(h = dlopen("winesailover.so", RTLD_NOW | RTLD_NOLOAD))) return false;
-   if (!(get_display = dlsym(h, "sailover_wsd_get_display")) || !get_display(&width, &height, &hz)) return false;
+   if (!(h = dlopen("wineobelisk.so", RTLD_NOW | RTLD_NOLOAD))) return false;
+   if (!(get_display = dlsym(h, "obelisk_wsd_get_display")) || !get_display(&width, &height, &hz)) return false;
 
    o = &list->outputs[0];
    memset(o, 0, sizeof(*o));

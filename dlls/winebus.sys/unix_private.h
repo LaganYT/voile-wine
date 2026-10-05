@@ -238,9 +238,9 @@ extern NTSTATUS xbox_bus_init(void *);
 extern NTSTATUS xbox_bus_wait(void *);
 extern NTSTATUS xbox_bus_stop(void *);
 
-extern NTSTATUS sailover_bus_init(void *);
-extern NTSTATUS sailover_bus_wait(void *);
-extern NTSTATUS sailover_bus_stop(void *);
+extern NTSTATUS obelisk_bus_init(void *);
+extern NTSTATUS obelisk_bus_wait(void *);
+extern NTSTATUS obelisk_bus_stop(void *);
 
 extern void bus_event_cleanup(struct bus_event *event);
 extern void bus_event_queue_destroy(struct list *queue);

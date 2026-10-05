@@ -1,11 +1,11 @@
 /*
- * Gamepads of SailOver's input service
+ * Gamepads of Obelisk's input service
  *
- * The service (sailover-input, a native macOS process) reads the Mac's gamepads with SDL3 and serves
- * them on a UNIX socket, WINE_SAILOVER_INPUT_SOCKET or /run/sailover/input.sock by default. Each
+ * The service (obelisk-input, a native macOS process) reads the Mac's gamepads with SDL3 and serves
+ * them on a UNIX socket, WINE_OBELISK_INPUT_SOCKET or /run/obelisk/input.sock by default. Each
  * gamepad becomes a HID gamepad with the layout of the SDL bus's mapped controllers, which
  * winexinput.sys offers through XInput; rumble goes back to the service. Wire format:
- * sailover_input_protocol.h. Without the variable and without a service at the default place, the
+ * obelisk_input_protocol.h. Without the variable and without a service at the default place, the
  * bus does not start. Otherwise it connects again every second while the service is missing: the
  * service may start after Wine, or a server kept from a previous game may outlive its service.
  *
@@ -57,7 +57,7 @@
 #include "wine/unixlib.h"
 
 #include "unix_private.h"
-#include "sailover_input_protocol.h"
+#include "obelisk_input_protocol.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
@@ -66,7 +66,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(hid);
 #endif
 
 /* guards the device list and the writes to the service */
-static pthread_mutex_t sailover_cs = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t obelisk_cs = PTHREAD_MUTEX_INITIALIZER;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
 
@@ -77,30 +77,30 @@ static int control_pipe[2] = {-1, -1};
 static BYTE message[sizeof(struct si_hdr) + SI_MAX_PAYLOAD];
 static size_t message_len;
 
-struct sailover_device
+struct obelisk_device
 {
     struct unix_device unix_device;
     UINT gamepad_id;
     BOOL started;
 };
 
-static inline struct sailover_device *impl_from_unix_device(struct unix_device *iface)
+static inline struct obelisk_device *impl_from_unix_device(struct unix_device *iface)
 {
-    return CONTAINING_RECORD(iface, struct sailover_device, unix_device);
+    return CONTAINING_RECORD(iface, struct obelisk_device, unix_device);
 }
 
-/* sailover_cs must be held */
-static struct sailover_device *find_device(UINT gamepad_id)
+/* obelisk_cs must be held */
+static struct obelisk_device *find_device(UINT gamepad_id)
 {
-    struct sailover_device *impl;
+    struct obelisk_device *impl;
 
-    LIST_FOR_EACH_ENTRY(impl, &device_list, struct sailover_device, unix_device.entry)
+    LIST_FOR_EACH_ENTRY(impl, &device_list, struct obelisk_device, unix_device.entry)
         if (impl->gamepad_id == gamepad_id) return impl;
 
     return NULL;
 }
 
-/* sailover_cs must be held */
+/* obelisk_cs must be held */
 static BOOL service_send(UINT type, const void *payload, UINT len)
 {
     struct si_hdr hdr = {type, len};
@@ -116,36 +116,36 @@ static BOOL service_send(UINT type, const void *payload, UINT len)
     return FALSE;
 }
 
-static void sailover_device_destroy(struct unix_device *iface)
+static void obelisk_device_destroy(struct unix_device *iface)
 {
 }
 
-static NTSTATUS sailover_device_start(struct unix_device *iface)
+static NTSTATUS obelisk_device_start(struct unix_device *iface)
 {
-    struct sailover_device *impl = impl_from_unix_device(iface);
+    struct obelisk_device *impl = impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     impl->started = TRUE;
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
 
     return STATUS_SUCCESS;
 }
 
-static void sailover_device_stop(struct unix_device *iface)
+static void obelisk_device_stop(struct unix_device *iface)
 {
-    struct sailover_device *impl = impl_from_unix_device(iface);
+    struct obelisk_device *impl = impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     impl->started = FALSE;
     list_remove(&impl->unix_device.entry);
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
 }
 
-static NTSTATUS sailover_device_haptics_start(struct unix_device *iface, UINT duration_ms,
+static NTSTATUS obelisk_device_haptics_start(struct unix_device *iface, UINT duration_ms,
                                               USHORT rumble_intensity, USHORT buzz_intensity,
                                               USHORT left_intensity, USHORT right_intensity)
 {
-    struct sailover_device *impl = impl_from_unix_device(iface);
+    struct obelisk_device *impl = impl_from_unix_device(iface);
     struct si_rumble rumble =
     {
         .gamepad_id = impl->gamepad_id,
@@ -160,51 +160,51 @@ static NTSTATUS sailover_device_haptics_start(struct unix_device *iface, UINT du
     TRACE("iface %p, duration_ms %u, rumble_intensity %u, buzz_intensity %u, left_intensity %u, right_intensity %u.\n",
           iface, duration_ms, rumble_intensity, buzz_intensity, left_intensity, right_intensity);
 
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     sent = service_send(SI_RUMBLE, &rumble, sizeof(rumble));
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
 
     return sent ? STATUS_SUCCESS : STATUS_DEVICE_NOT_CONNECTED;
 }
 
-static NTSTATUS sailover_device_haptics_stop(struct unix_device *iface)
+static NTSTATUS obelisk_device_haptics_stop(struct unix_device *iface)
 {
-    return sailover_device_haptics_start(iface, 0, 0, 0, 0, 0);
+    return obelisk_device_haptics_start(iface, 0, 0, 0, 0, 0);
 }
 
-static NTSTATUS sailover_device_physical_device_control(struct unix_device *iface, USAGE control)
-{
-    return STATUS_NOT_SUPPORTED;
-}
-
-static NTSTATUS sailover_device_physical_device_set_gain(struct unix_device *iface, BYTE percent)
+static NTSTATUS obelisk_device_physical_device_control(struct unix_device *iface, USAGE control)
 {
     return STATUS_NOT_SUPPORTED;
 }
 
-static NTSTATUS sailover_device_physical_effect_control(struct unix_device *iface, BYTE index,
+static NTSTATUS obelisk_device_physical_device_set_gain(struct unix_device *iface, BYTE percent)
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS obelisk_device_physical_effect_control(struct unix_device *iface, BYTE index,
                                                         USAGE control, BYTE iterations)
 {
     return STATUS_NOT_SUPPORTED;
 }
 
-static NTSTATUS sailover_device_physical_effect_update(struct unix_device *iface, BYTE index,
+static NTSTATUS obelisk_device_physical_effect_update(struct unix_device *iface, BYTE index,
                                                        struct effect_params *params)
 {
     return STATUS_NOT_SUPPORTED;
 }
 
-static const struct hid_device_vtbl sailover_device_vtbl =
+static const struct hid_device_vtbl obelisk_device_vtbl =
 {
-    sailover_device_destroy,
-    sailover_device_start,
-    sailover_device_stop,
-    sailover_device_haptics_start,
-    sailover_device_haptics_stop,
-    sailover_device_physical_device_control,
-    sailover_device_physical_device_set_gain,
-    sailover_device_physical_effect_control,
-    sailover_device_physical_effect_update,
+    obelisk_device_destroy,
+    obelisk_device_start,
+    obelisk_device_stop,
+    obelisk_device_haptics_start,
+    obelisk_device_haptics_stop,
+    obelisk_device_physical_device_control,
+    obelisk_device_physical_device_set_gain,
+    obelisk_device_physical_effect_control,
+    obelisk_device_physical_effect_update,
 };
 
 /* The SDL bus's button numbers for a mapped controller, by SDL gamepad button; -1 has none. */
@@ -253,8 +253,8 @@ static NTSTATUS build_report_descriptor(struct unix_device *iface, BOOL rumble)
     return STATUS_SUCCESS;
 }
 
-/* sailover_cs must be held */
-static void sailover_add_device(const struct si_ev_added *added)
+/* obelisk_cs must be held */
+static void obelisk_add_device(const struct si_ev_added *added)
 {
     struct device_desc desc =
     {
@@ -267,7 +267,7 @@ static void sailover_add_device(const struct si_ev_added *added)
         .manufacturer = {'S','a','i','l','O','v','e','r',0},
     };
     char name[sizeof(added->name)], serial[sizeof(added->serial)];
-    struct sailover_device *impl;
+    struct obelisk_device *impl;
 
     if (find_device(added->gamepad_id)) return;
 
@@ -283,7 +283,7 @@ static void sailover_add_device(const struct si_ev_added *added)
 
     TRACE("gamepad %u, desc %s.\n", added->gamepad_id, debugstr_device_desc(&desc));
 
-    if (!(impl = hid_device_create(&sailover_device_vtbl, sizeof(struct sailover_device)))) return;
+    if (!(impl = hid_device_create(&obelisk_device_vtbl, sizeof(struct obelisk_device)))) return;
     impl->gamepad_id = added->gamepad_id;
     if (build_report_descriptor(&impl->unix_device, !!(added->caps & SI_CAP_RUMBLE)))
     {
@@ -295,10 +295,10 @@ static void sailover_add_device(const struct si_ev_added *added)
     bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc);
 }
 
-/* sailover_cs must be held */
+/* obelisk_cs must be held */
 static void process_message(const struct si_hdr *hdr, const BYTE *payload)
 {
-    struct sailover_device *impl;
+    struct obelisk_device *impl;
 
     switch (hdr->type)
     {
@@ -317,7 +317,7 @@ static void process_message(const struct si_hdr *hdr, const BYTE *payload)
         break;
     }
     case SI_EV_ADDED:
-        if (hdr->len >= sizeof(struct si_ev_added)) sailover_add_device((const struct si_ev_added *)payload);
+        if (hdr->len >= sizeof(struct si_ev_added)) obelisk_add_device((const struct si_ev_added *)payload);
         break;
     case SI_EV_REMOVED:
     {
@@ -345,27 +345,27 @@ static void process_message(const struct si_hdr *hdr, const BYTE *payload)
 /* Reads what the service sent; when it is gone, its gamepads go with it. */
 static void read_service(void)
 {
-    struct sailover_device *impl;
+    struct obelisk_device *impl;
     struct si_hdr hdr;
     ssize_t ret;
 
     do ret = read(service_fd, message + message_len, sizeof(message) - message_len);
     while (ret < 0 && errno == EINTR);
 
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     if (ret <= 0)
     {
         WARN("lost the input service: %s\n", ret < 0 ? strerror(errno) : "closed");
         close(service_fd);
         service_fd = -1;
-        LIST_FOR_EACH_ENTRY(impl, &device_list, struct sailover_device, unix_device.entry)
+        LIST_FOR_EACH_ENTRY(impl, &device_list, struct obelisk_device, unix_device.entry)
         {
             /* a service started again numbers its gamepads from scratch */
             if (!impl->gamepad_id) continue;
             bus_event_queue_device_removed(&event_queue, &impl->unix_device);
             impl->gamepad_id = 0;
         }
-        pthread_mutex_unlock(&sailover_cs);
+        pthread_mutex_unlock(&obelisk_cs);
         return;
     }
 
@@ -390,10 +390,10 @@ static void read_service(void)
         message_len -= total;
         process_message(&hdr, payload);
     }
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
 }
 
-/* Connects to the service and greets it; sailover_cs must be held. */
+/* Connects to the service and greets it; obelisk_cs must be held. */
 static void connect_service(void)
 {
     struct si_hello hello = {SI_PROTOCOL_VERSION, getpid()};
@@ -423,10 +423,10 @@ static void connect_service(void)
     service_fd = -1;
 }
 
-NTSTATUS sailover_bus_init(void *args)
+NTSTATUS obelisk_bus_init(void *args)
 {
-    static const char linux_engine_path[] = "/run/sailover/input.sock";
-    const char *path = getenv("WINE_SAILOVER_INPUT_SOCKET");
+    static const char linux_engine_path[] = "/run/obelisk/input.sock";
+    const char *path = getenv("WINE_OBELISK_INPUT_SOCKET");
 
     if (!path && access(linux_engine_path, F_OK)) return STATUS_NOT_SUPPORTED;
     if (!path) path = linux_engine_path;
@@ -438,14 +438,14 @@ NTSTATUS sailover_bus_init(void *args)
     fcntl(control_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(control_pipe[1], F_SETFD, FD_CLOEXEC);
 
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     connect_service();
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
     if (service_fd < 0) TRACE("no input service at %s yet\n", path);
     return STATUS_SUCCESS;
 }
 
-NTSTATUS sailover_bus_wait(void *args)
+NTSTATUS obelisk_bus_wait(void *args)
 {
     struct bus_event *result = args;
     struct pollfd fds[2];
@@ -474,27 +474,27 @@ NTSTATUS sailover_bus_wait(void *args)
         }
         else if (!service_incompatible)
         {
-            pthread_mutex_lock(&sailover_cs);
+            pthread_mutex_lock(&obelisk_cs);
             connect_service();
-            pthread_mutex_unlock(&sailover_cs);
+            pthread_mutex_unlock(&obelisk_cs);
         }
     }
 
-    TRACE("SailOver main loop exiting\n");
+    TRACE("Obelisk main loop exiting\n");
     bus_event_queue_destroy(&event_queue);
-    pthread_mutex_lock(&sailover_cs);
+    pthread_mutex_lock(&obelisk_cs);
     if (service_fd >= 0) close(service_fd);
     service_fd = -1;
-    pthread_mutex_unlock(&sailover_cs);
+    pthread_mutex_unlock(&obelisk_cs);
     close(control_pipe[0]);
     close(control_pipe[1]);
     control_pipe[0] = control_pipe[1] = -1;
     return STATUS_SUCCESS;
 }
 
-NTSTATUS sailover_bus_stop(void *args)
+NTSTATUS obelisk_bus_stop(void *args)
 {
     if (control_pipe[1] < 0) return STATUS_SUCCESS;
-    if (write(control_pipe[1], "q", 1) != 1) WARN("failed to stop the SailOver bus: %s\n", strerror(errno));
+    if (write(control_pipe[1], "q", 1) != 1) WARN("failed to stop the Obelisk bus: %s\n", strerror(errno));
     return STATUS_SUCCESS;
 }

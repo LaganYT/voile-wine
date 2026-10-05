@@ -1,7 +1,0 @@
-MODULE    = winesailaudio.drv
-UNIXLIB   = winesailaudio.so
-IMPORTS   = uuid ole32 user32 advapi32
-UNIX_LIBS = $(PTHREAD_LIBS)
-
-SOURCES = \
-	sailaudio.c

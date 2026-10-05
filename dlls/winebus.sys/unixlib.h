@@ -63,7 +63,7 @@ struct bus_options
     BOOL disable_udevd;
     BOOL split_controllers;
     BOOL map_controllers;
-    BOOL sailover_gamepads; /* the SailOver bus serves the gamepads */
+    BOOL obelisk_gamepads; /* the Obelisk bus serves the gamepads */
     UINT mappings_count;
     struct list devices;
     char **mappings;
@@ -153,9 +153,9 @@ enum unix_funcs
     xbox_init,
     xbox_wait,
     xbox_stop,
-    sailover_init,
-    sailover_wait,
-    sailover_stop,
+    obelisk_init,
+    obelisk_wait,
+    obelisk_stop,
     mouse_create,
     keyboard_create,
     device_remove,

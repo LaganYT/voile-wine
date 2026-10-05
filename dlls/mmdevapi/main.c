@@ -125,7 +125,7 @@ fail:
 
 static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
 {
-    static WCHAR default_list[] = L"sailaudio,pulse,alsa,oss,coreaudio"; /* SailOver: wsd (CoreAudio on the host) first */
+    static WCHAR default_list[] = L"obeliskaudio,pulse,alsa,oss,coreaudio"; /* Obelisk: wsd (CoreAudio on the host) first */
     DriverFuncs driver;
     HKEY key;
     WCHAR reg_list[256], *p, *next, *driver_list = default_list;

@@ -314,9 +314,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     xbox_bus_init,
     xbox_bus_wait,
     xbox_bus_stop,
-    sailover_bus_init,
-    sailover_bus_wait,
-    sailover_bus_stop,
+    obelisk_bus_init,
+    obelisk_bus_wait,
+    obelisk_bus_stop,
     mouse_device_create,
     keyboard_device_create,
     unix_device_remove,
@@ -448,7 +448,7 @@ static NTSTATUS wow64_sdl_bus_init(void *args)
         BOOL disable_udevd;
         BOOL split_controllers;
         BOOL map_controllers;
-        BOOL sailover_gamepads;
+        BOOL obelisk_gamepads;
         UINT mappings_count;
         PTR32 mappings;
     } const *params32 = args;
@@ -460,7 +460,7 @@ static NTSTATUS wow64_sdl_bus_init(void *args)
         params32->disable_udevd,
         params32->split_controllers,
         params32->map_controllers,
-        params32->sailover_gamepads,
+        params32->obelisk_gamepads,
         params32->mappings_count,
     };
     PTR32 *mappings = UlongToPtr(params32->mappings);
@@ -560,9 +560,9 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     xbox_bus_init,
     xbox_bus_wait,
     xbox_bus_stop,
-    sailover_bus_init,
-    sailover_bus_wait,
-    sailover_bus_stop,
+    obelisk_bus_init,
+    obelisk_bus_wait,
+    obelisk_bus_stop,
     mouse_device_create,
     keyboard_device_create,
     unix_device_remove,

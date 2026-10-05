@@ -1,9 +1,9 @@
 /*
- * SailOver audio driver (unixlib): WASAPI render streams played by the SailOver window server (wsd) on macOS.
+ * Obelisk audio driver (unixlib): WASAPI render streams played by the Obelisk window server (wsd) on macOS.
  *
  * Copyright 2011 Andrew Eikum for CodeWeavers
  *           2022 Huw Davies
- * Copyright 2026 SailOver
+ * Copyright 2026 Obelisk
  *
  * Derived from the OSS driver (dlls/wineoss.drv/oss.c): the same local buffer and timer loop, with the OSS device
  * replaced by a ring of frames shared with wsd (a memfd, struct wsd_audio_ring in wsd_protocol.h). The timer loop
@@ -54,9 +54,9 @@
 #include "../mmdevapi/unixlib.h"
 #include "wsd_protocol.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(sailaudio);
+WINE_DEFAULT_DEBUG_CHANNEL(obeliskaudio);
 
-struct sail_stream
+struct obelisk_stream
 {
     WAVEFORMATEX *fmt;
     EDataFlow flow;
@@ -95,7 +95,7 @@ static pthread_mutex_t wsd_lock = PTHREAD_MUTEX_INITIALIZER;
 static int wsd_fd = -1;
 static UINT32 next_stream_id = 1;
 
-static NTSTATUS sail_not_implemented(void *args)
+static NTSTATUS obelisk_not_implemented(void *args)
 {
     return STATUS_SUCCESS;
 }
@@ -126,8 +126,8 @@ static int muldiv( int a, int b, int c )
 
 static const char *socket_path(void)
 {
-    const char *path = getenv("WINE_SAILOVER_SOCKET");
-    return path ? path : "/run/sailover/wsd.sock";
+    const char *path = getenv("WINE_OBELISK_SOCKET");
+    return path ? path : "/run/obelisk/wsd.sock";
 }
 
 static BOOL write_all(int fd, const void *data, size_t size, int fd_to_send)
@@ -275,30 +275,30 @@ static BOOL wsd_request_sync(UINT32 type, const void *payload, UINT32 len, int f
     return ok;
 }
 
-static void sail_lock(struct sail_stream *stream)
+static void obelisk_lock(struct obelisk_stream *stream)
 {
     pthread_mutex_lock(&stream->lock);
 }
 
-static void sail_unlock(struct sail_stream *stream)
+static void obelisk_unlock(struct obelisk_stream *stream)
 {
     pthread_mutex_unlock(&stream->lock);
 }
 
-static NTSTATUS sail_unlock_result(struct sail_stream *stream,
+static NTSTATUS obelisk_unlock_result(struct obelisk_stream *stream,
                                    HRESULT *result, HRESULT value)
 {
     *result = value;
-    sail_unlock(stream);
+    obelisk_unlock(stream);
     return STATUS_SUCCESS;
 }
 
-static struct sail_stream *handle_get_stream(stream_handle h)
+static struct obelisk_stream *handle_get_stream(stream_handle h)
 {
-    return (struct sail_stream *)(UINT_PTR)h;
+    return (struct obelisk_stream *)(UINT_PTR)h;
 }
 
-static NTSTATUS sail_test_connect(void *args)
+static NTSTATUS obelisk_test_connect(void *args)
 {
     struct test_connect_params *params = args;
     BOOL ok;
@@ -310,7 +310,7 @@ static NTSTATUS sail_test_connect(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_process_attach(void *args)
+static NTSTATUS obelisk_process_attach(void *args)
 {
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset)
@@ -324,14 +324,14 @@ static NTSTATUS sail_process_attach(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_main_loop(void *args)
+static NTSTATUS obelisk_main_loop(void *args)
 {
     struct main_loop_params *params = args;
     NtSetEvent(params->event, NULL);
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_get_endpoint_ids(void *args)
+static NTSTATUS obelisk_get_endpoint_ids(void *args)
 {
     static const WCHAR name[] = {'S','p','e','a','k','e','r','s',' ','(','m','a','c','O','S',')',0};
     struct get_endpoint_ids_params *params = args;
@@ -475,7 +475,7 @@ static HRESULT check_format(AUDCLNT_SHAREMODE share, const WAVEFORMATEX *fmt)
 }
 
 /* the shared ring and its server side stream */
-static HRESULT open_ring(struct sail_stream *stream)
+static HRESULT open_ring(struct obelisk_stream *stream)
 {
     struct wsd_audio_open o;
     SIZE_T size;
@@ -521,18 +521,18 @@ static HRESULT open_ring(struct sail_stream *stream)
     return S_OK;
 }
 
-static void stream_command(struct sail_stream *stream, UINT32 type)
+static void stream_command(struct obelisk_stream *stream, UINT32 type)
 {
     struct wsd_audio_stream s = { stream->stream_id, 0 };
     if(!wsd_send(type, &s, sizeof(s), -1))
         WARN("stream %u: request %u not sent\n", stream->stream_id, type);
 }
 
-static NTSTATUS sail_create_stream(void *args)
+static NTSTATUS obelisk_create_stream(void *args)
 {
     struct create_stream_params *params = args;
     WAVEFORMATEXTENSIBLE *fmtex;
-    struct sail_stream *stream;
+    struct obelisk_stream *stream;
     SIZE_T size;
 
     if(params->flow != eRender){
@@ -598,10 +598,10 @@ exit:
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_release_stream(void *args)
+static NTSTATUS obelisk_release_stream(void *args)
 {
     struct release_stream_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
     if(params->timer_thread){
@@ -628,53 +628,53 @@ static NTSTATUS sail_release_stream(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_start(void *args)
+static NTSTATUS obelisk_start(void *args)
 {
     struct start_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_SET);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_SET);
 
     if(stream->playing)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
 
     stream->playing = TRUE;
     stream_command(stream, WSD_AUDIO_START);
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_stop(void *args)
+static NTSTATUS obelisk_stop(void *args)
 {
     struct stop_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(!stream->playing)
-        return sail_unlock_result(stream, &params->result, S_FALSE);
+        return obelisk_unlock_result(stream, &params->result, S_FALSE);
 
     stream->playing = FALSE;
     stream_command(stream, WSD_AUDIO_STOP); /* pause: the frames in the ring stay queued */
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_reset(void *args)
+static NTSTATUS obelisk_reset(void *args)
 {
     struct reset_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(stream->playing)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_NOT_STOPPED);
 
     if(stream->getbuf_last)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING);
 
     /* drop what wsd has not played: its read position jumps to our write position */
     stream_command(stream, WSD_AUDIO_RESET);
@@ -684,10 +684,10 @@ static NTSTATUS sail_reset(void *args)
     stream->lcl_offs_frames = 0;
     stream->in_ring_frames = 0;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static void silence_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 frames)
+static void silence_buffer(struct obelisk_stream *stream, BYTE *buffer, UINT32 frames)
 {
     WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE*)stream->fmt;
     if((stream->fmt->wFormatTag == WAVE_FORMAT_PCM ||
@@ -700,7 +700,7 @@ static void silence_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 fram
 }
 
 /* copy frames from the local buffer into the ring, at ring position ring_written */
-static void ring_put(struct sail_stream *stream, const BYTE *src, UINT32 frames)
+static void ring_put(struct obelisk_stream *stream, const BYTE *src, UINT32 frames)
 {
     UINT32 block = stream->fmt->nBlockAlign;
     while(frames){
@@ -716,7 +716,7 @@ static void ring_put(struct sail_stream *stream, const BYTE *src, UINT32 frames)
     }
 }
 
-static void sail_write_data(struct sail_stream *stream)
+static void obelisk_write_data(struct obelisk_stream *stream)
 {
     UINT32 in_ring_frames, write_limit, write_offs_frames, new_frames, to_write_frames, space;
     UINT64 read_frames;
@@ -768,14 +768,14 @@ static void sail_write_data(struct sail_stream *stream)
     atomic_store_explicit((_Atomic UINT64 *)&stream->ring->write_frames, stream->ring_written, memory_order_release);
 }
 
-static NTSTATUS sail_timer_loop(void *args)
+static NTSTATUS obelisk_timer_loop(void *args)
 {
     struct timer_loop_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     LARGE_INTEGER delay, now, next;
     int adjust;
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     delay.QuadPart = -stream->period;
     NtQueryPerformanceCounter(&now, NULL);
@@ -783,14 +783,14 @@ static NTSTATUS sail_timer_loop(void *args)
 
     while(!stream->please_quit){
         if(stream->playing && stream->held_frames)
-            sail_write_data(stream);
+            obelisk_write_data(stream);
         if(stream->event)
             NtSetEvent(stream->event, NULL);
-        sail_unlock(stream);
+        obelisk_unlock(stream);
 
         NtDelayExecution(FALSE, &delay);
 
-        sail_lock(stream);
+        obelisk_lock(stream);
         NtQueryPerformanceCounter(&now, NULL);
         adjust = next.QuadPart - now.QuadPart;
         if(adjust > stream->period / 2)
@@ -801,29 +801,29 @@ static NTSTATUS sail_timer_loop(void *args)
         next.QuadPart += stream->period;
     }
 
-    sail_unlock(stream);
+    obelisk_unlock(stream);
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_get_render_buffer(void *args)
+static NTSTATUS obelisk_get_render_buffer(void *args)
 {
     struct get_render_buffer_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT32 write_pos, frames = params->frames;
     BYTE **data = params->data;
     SIZE_T size;
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(stream->getbuf_last)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
 
     if(!frames)
-        return sail_unlock_result(stream, &params->result, S_OK);
+        return obelisk_unlock_result(stream, &params->result, S_OK);
 
     if(stream->held_frames + frames > stream->bufsize_frames)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
 
     write_pos =
         (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
@@ -838,7 +838,7 @@ static NTSTATUS sail_get_render_buffer(void *args)
             if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
                                        &size, MEM_COMMIT, PAGE_READWRITE)){
                 stream->tmp_buffer_frames = 0;
-                return sail_unlock_result(stream, &params->result, E_OUTOFMEMORY);
+                return obelisk_unlock_result(stream, &params->result, E_OUTOFMEMORY);
             }
             stream->tmp_buffer_frames = frames;
         }
@@ -851,10 +851,10 @@ static NTSTATUS sail_get_render_buffer(void *args)
 
     silence_buffer(stream, *data, frames);
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static void sail_wrap_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 written_frames)
+static void obelisk_wrap_buffer(struct obelisk_stream *stream, BYTE *buffer, UINT32 written_frames)
 {
     UINT32 write_offs_frames =
         (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
@@ -872,26 +872,26 @@ static void sail_wrap_buffer(struct sail_stream *stream, BYTE *buffer, UINT32 wr
     }
 }
 
-static NTSTATUS sail_release_render_buffer(void *args)
+static NTSTATUS obelisk_release_render_buffer(void *args)
 {
     struct release_render_buffer_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT32 written_frames = params->written_frames;
     UINT flags = params->flags;
     BYTE *buffer;
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(!written_frames){
         stream->getbuf_last = 0;
-        return sail_unlock_result(stream, &params->result, S_OK);
+        return obelisk_unlock_result(stream, &params->result, S_OK);
     }
 
     if(!stream->getbuf_last)
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
 
     if(written_frames > (stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
 
     if(stream->getbuf_last >= 0)
         buffer = stream->local_buffer + stream->fmt->nBlockAlign *
@@ -903,30 +903,30 @@ static NTSTATUS sail_release_render_buffer(void *args)
         silence_buffer(stream, buffer, written_frames);
 
     if(stream->getbuf_last < 0)
-        sail_wrap_buffer(stream, buffer, written_frames);
+        obelisk_wrap_buffer(stream, buffer, written_frames);
 
     stream->held_frames += written_frames;
     stream->written_frames += written_frames;
     stream->getbuf_last = 0;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_capture_buffer(void *args)
+static NTSTATUS obelisk_get_capture_buffer(void *args)
 {
     struct get_capture_buffer_params *params = args;
     params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_release_capture_buffer(void *args)
+static NTSTATUS obelisk_release_capture_buffer(void *args)
 {
     struct release_capture_buffer_params *params = args;
     params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_is_format_supported(void *args)
+static NTSTATUS obelisk_is_format_supported(void *args)
 {
     struct is_format_supported_params *params = args;
 
@@ -935,7 +935,7 @@ static NTSTATUS sail_is_format_supported(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_get_mix_format(void *args)
+static NTSTATUS obelisk_get_mix_format(void *args)
 {
     struct get_mix_format_params *params = args;
     WAVEFORMATEXTENSIBLE *fmt = params->fmt;
@@ -961,7 +961,7 @@ static NTSTATUS sail_get_mix_format(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_get_device_period(void *args)
+static NTSTATUS obelisk_get_device_period(void *args)
 {
     struct get_device_period_params *params = args;
 
@@ -975,77 +975,77 @@ static NTSTATUS sail_get_device_period(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_get_buffer_size(void *args)
+static NTSTATUS obelisk_get_buffer_size(void *args)
 {
     struct get_buffer_size_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     *params->frames = stream->bufsize_frames;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_latency(void *args)
+static NTSTATUS obelisk_get_latency(void *args)
 {
     struct get_latency_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     /* pretend we process audio in Period chunks, so max latency includes
      * the period time.  Some native machines add .6666ms in shared mode. */
     *params->latency = stream->period + 6666;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_current_padding(void *args)
+static NTSTATUS obelisk_get_current_padding(void *args)
 {
     struct get_current_padding_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     *params->padding = stream->held_frames;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_next_packet_size(void *args)
+static NTSTATUS obelisk_get_next_packet_size(void *args)
 {
     struct get_next_packet_size_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT32 *frames = params->frames;
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     *frames = stream->held_frames < stream->period_frames ? 0 : stream->period_frames;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_frequency(void *args)
+static NTSTATUS obelisk_get_frequency(void *args)
 {
     struct get_frequency_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT64 *freq = params->freq;
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(stream->share == AUDCLNT_SHAREMODE_SHARED)
         *freq = (UINT64)stream->fmt->nSamplesPerSec * stream->fmt->nBlockAlign;
     else
         *freq = stream->fmt->nSamplesPerSec;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_get_position(void *args)
+static NTSTATUS obelisk_get_position(void *args)
 {
     struct get_position_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT64 *pos = params->pos, *qpctime = params->qpctime;
 
     if (params->device) {
@@ -1054,7 +1054,7 @@ static NTSTATUS sail_get_position(void *args)
         return STATUS_SUCCESS;
     }
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     /* held_frames still counts what wsd has not read from the ring: the difference is what was played */
     *pos = stream->written_frames - stream->held_frames;
@@ -1073,13 +1073,13 @@ static NTSTATUS sail_get_position(void *args)
         *qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
     }
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_set_volumes(void *args)
+static NTSTATUS obelisk_set_volumes(void *args)
 {
     struct set_volumes_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
     UINT16 i;
 
     if (params->master_volume) {
@@ -1091,44 +1091,44 @@ static NTSTATUS sail_set_volumes(void *args)
         }
     }
 
-    sail_lock(stream);
+    obelisk_lock(stream);
     stream->mute = !params->master_volume;
-    sail_unlock(stream);
+    obelisk_unlock(stream);
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_set_event_handle(void *args)
+static NTSTATUS obelisk_set_event_handle(void *args)
 {
     struct set_event_handle_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
     if(!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
-        return sail_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED);
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED);
 
     if (stream->event){
         FIXME("called twice\n");
-        return sail_unlock_result(stream, &params->result, HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
+        return obelisk_unlock_result(stream, &params->result, HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
     }
 
     stream->event = params->event;
 
-    return sail_unlock_result(stream, &params->result, S_OK);
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
-static NTSTATUS sail_is_started(void *args)
+static NTSTATUS obelisk_is_started(void *args)
 {
     struct is_started_params *params = args;
-    struct sail_stream *stream = handle_get_stream(params->stream);
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
 
-    sail_lock(stream);
+    obelisk_lock(stream);
 
-    return sail_unlock_result(stream, &params->result, stream->playing ? S_OK : S_FALSE);
+    return obelisk_unlock_result(stream, &params->result, stream->playing ? S_OK : S_FALSE);
 }
 
-static NTSTATUS sail_get_prop_value(void *args)
+static NTSTATUS obelisk_get_prop_value(void *args)
 {
     struct get_prop_value_params *params = args;
 
@@ -1138,14 +1138,14 @@ static NTSTATUS sail_get_prop_value(void *args)
 }
 
 /* No MIDI and no aux (mixer) devices: mmdevapi uses the selected audio driver for MIDI too. */
-static NTSTATUS sail_midi_init(void *args)
+static NTSTATUS obelisk_midi_init(void *args)
 {
     struct midi_init_params *params = args;
     *params->err = MMSYSERR_ERROR; /* DRV_LOAD fails: no MIDI notification thread */
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_midi_out_message(void *args)
+static NTSTATUS obelisk_midi_out_message(void *args)
 {
     struct midi_out_message_params *params = args;
     if (params->notify) params->notify->send_notify = FALSE;
@@ -1153,7 +1153,7 @@ static NTSTATUS sail_midi_out_message(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_midi_in_message(void *args)
+static NTSTATUS obelisk_midi_in_message(void *args)
 {
     struct midi_in_message_params *params = args;
     if (params->notify) params->notify->send_notify = FALSE;
@@ -1161,14 +1161,14 @@ static NTSTATUS sail_midi_in_message(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_midi_notify_wait(void *args)
+static NTSTATUS obelisk_midi_notify_wait(void *args)
 {
     struct midi_notify_wait_params *params = args;
     *params->quit = TRUE;
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS sail_aux_message(void *args)
+static NTSTATUS obelisk_aux_message(void *args)
 {
     struct aux_message_params *params = args;
     *params->err = params->msg == AUXDM_GETNUMDEVS ? 0 : MMSYSERR_BADDEVICEID;
@@ -1177,43 +1177,43 @@ static NTSTATUS sail_aux_message(void *args)
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
-    sail_process_attach,
-    sail_not_implemented,
-    sail_main_loop,
-    sail_get_endpoint_ids,
-    sail_create_stream,
-    sail_release_stream,
-    sail_start,
-    sail_stop,
-    sail_reset,
-    sail_timer_loop,
-    sail_get_render_buffer,
-    sail_release_render_buffer,
-    sail_get_capture_buffer,
-    sail_release_capture_buffer,
-    sail_is_format_supported,
-    sail_not_implemented,
-    sail_get_mix_format,
-    sail_get_device_period,
-    sail_get_buffer_size,
-    sail_get_latency,
-    sail_get_current_padding,
-    sail_get_next_packet_size,
-    sail_get_frequency,
-    sail_get_position,
-    sail_set_volumes,
-    sail_set_event_handle,
-    sail_not_implemented,
-    sail_test_connect,
-    sail_is_started,
-    sail_get_prop_value,
-    sail_not_implemented,
-    sail_midi_init,
-    sail_not_implemented,
-    sail_midi_out_message,
-    sail_midi_in_message,
-    sail_midi_notify_wait,
-    sail_aux_message,
+    obelisk_process_attach,
+    obelisk_not_implemented,
+    obelisk_main_loop,
+    obelisk_get_endpoint_ids,
+    obelisk_create_stream,
+    obelisk_release_stream,
+    obelisk_start,
+    obelisk_stop,
+    obelisk_reset,
+    obelisk_timer_loop,
+    obelisk_get_render_buffer,
+    obelisk_release_render_buffer,
+    obelisk_get_capture_buffer,
+    obelisk_release_capture_buffer,
+    obelisk_is_format_supported,
+    obelisk_not_implemented,
+    obelisk_get_mix_format,
+    obelisk_get_device_period,
+    obelisk_get_buffer_size,
+    obelisk_get_latency,
+    obelisk_get_current_padding,
+    obelisk_get_next_packet_size,
+    obelisk_get_frequency,
+    obelisk_get_position,
+    obelisk_set_volumes,
+    obelisk_set_event_handle,
+    obelisk_not_implemented,
+    obelisk_test_connect,
+    obelisk_is_started,
+    obelisk_get_prop_value,
+    obelisk_not_implemented,
+    obelisk_midi_init,
+    obelisk_not_implemented,
+    obelisk_midi_out_message,
+    obelisk_midi_in_message,
+    obelisk_midi_notify_wait,
+    obelisk_aux_message,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);

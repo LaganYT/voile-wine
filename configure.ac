@@ -1089,13 +1089,13 @@ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
 
-dnl SailOver: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
+dnl Obelisk: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
 case $host_os in
   linux*) ;;
   *)
-    enable_winesailaudio_drv=${enable_winesailaudio_drv:-no}
+    enable_wineobeliskaudio_drv=${enable_wineobeliskaudio_drv:-no}
     enable_nptunix=${enable_nptunix:-no}
-    enable_winesailover_drv=${enable_winesailover_drv:-no}
+    enable_wineobelisk_drv=${enable_wineobelisk_drv:-no}
     ;;
 esac
 
@@ -3399,12 +3399,12 @@ WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
 WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
 WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
 WINE_CONFIG_MAKEFILE(dlls/winemapi)
+WINE_CONFIG_MAKEFILE(dlls/wineobelisk.drv)
+WINE_CONFIG_MAKEFILE(dlls/wineobeliskaudio.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)
 WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)
-WINE_CONFIG_MAKEFILE(dlls/winesailaudio.drv)
-WINE_CONFIG_MAKEFILE(dlls/winesailover.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
 WINE_CONFIG_MAKEFILE(dlls/winevulkan)
 WINE_CONFIG_MAKEFILE(dlls/winewayland.drv)

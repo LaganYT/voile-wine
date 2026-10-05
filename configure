@@ -1550,13 +1550,13 @@ enable_winegstreamer
 enable_winehid_sys
 enable_winemac_drv
 enable_winemapi
+enable_wineobelisk_drv
+enable_wineobeliskaudio_drv
 enable_wineoss_drv
 enable_wineps_drv
 enable_winepulse_drv
 enable_wineusb_sys
 enable_winevulkan
-enable_winesailover_drv
-enable_winesailaudio_drv
 enable_winewayland_drv
 enable_winex11_drv
 enable_winexinput_sys
@@ -12326,13 +12326,13 @@ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
 
-# SailOver: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
+# Obelisk: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
 case $host_os in
   linux*) ;;
   *)
-    enable_winesailaudio_drv=${enable_winesailaudio_drv:-no}
+    enable_wineobeliskaudio_drv=${enable_wineobeliskaudio_drv:-no}
     enable_nptunix=${enable_nptunix:-no}
-    enable_winesailover_drv=${enable_winesailover_drv:-no}
+    enable_wineobelisk_drv=${enable_wineobelisk_drv:-no}
     ;;
 esac
 
@@ -23405,14 +23405,14 @@ wine_fn_config_makefile dlls/winegstreamer enable_winegstreamer
 wine_fn_config_makefile dlls/winehid.sys enable_winehid_sys
 wine_fn_config_makefile dlls/winemac.drv enable_winemac_drv
 wine_fn_config_makefile dlls/winemapi enable_winemapi
+wine_fn_config_makefile dlls/wineobelisk.drv enable_wineobelisk_drv
+wine_fn_config_makefile dlls/wineobeliskaudio.drv enable_wineobeliskaudio_drv
 wine_fn_config_makefile dlls/wineoss.drv enable_wineoss_drv
 wine_fn_config_makefile dlls/wineps.drv enable_wineps_drv
 wine_fn_config_makefile dlls/wineps16.drv16 enable_win16
 wine_fn_config_makefile dlls/winepulse.drv enable_winepulse_drv
 wine_fn_config_makefile dlls/wineusb.sys enable_wineusb_sys
 wine_fn_config_makefile dlls/winevulkan enable_winevulkan
-wine_fn_config_makefile dlls/winesailover.drv enable_winesailover_drv
-wine_fn_config_makefile dlls/winesailaudio.drv enable_winesailaudio_drv
 wine_fn_config_makefile dlls/winewayland.drv enable_winewayland_drv
 wine_fn_config_makefile dlls/winex11.drv enable_winex11_drv
 wine_fn_config_makefile dlls/winexinput.sys enable_winexinput_sys

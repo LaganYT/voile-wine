@@ -306,10 +306,10 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
         return;
     }
 
-    if (options->sailover_gamepads && (usages.Usage == HID_USAGE_GENERIC_GAMEPAD || is_xbox_gamepad(desc.vid, desc.pid) ||
+    if (options->obelisk_gamepads && (usages.Usage == HID_USAGE_GENERIC_GAMEPAD || is_xbox_gamepad(desc.vid, desc.pid) ||
         is_dualshock4_gamepad(desc.vid, desc.pid) || is_dualsense_gamepad(desc.vid, desc.pid)))
     {
-        TRACE("Leaving HID device %p (vid %04x, pid %04x) to the SailOver bus\n", IOHIDDevice, desc.vid, desc.pid);
+        TRACE("Leaving HID device %p (vid %04x, pid %04x) to the Obelisk bus\n", IOHIDDevice, desc.vid, desc.pid);
         return;
     }
 

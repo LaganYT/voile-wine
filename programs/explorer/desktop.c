@@ -40,8 +40,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(explorer);
 #define DESKTOP_CLASS_ATOM ((LPCWSTR)MAKEINTATOM(32769))
 #define DESKTOP_ALL_ACCESS 0x01ff
 
-/* SailOver: the wsd display driver first */
-static const WCHAR default_driver[] = L"sailover,mac,x11,wayland";
+/* Obelisk: the wsd display driver first */
+static const WCHAR default_driver[] = L"obelisk,mac,x11,wayland";
 
 static BOOL using_root = TRUE;
 
