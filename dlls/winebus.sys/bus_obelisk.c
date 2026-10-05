@@ -264,7 +264,7 @@ static void obelisk_add_device(const struct si_ev_added *added)
         .input = -1,
         .uid = added->gamepad_id,
         .is_gamepad = TRUE,
-        .manufacturer = {'S','a','i','l','O','v','e','r',0},
+        .manufacturer = {'O','b','e','l','i','s','k',0},
     };
     char name[sizeof(added->name)], serial[sizeof(added->serial)];
     struct obelisk_device *impl;

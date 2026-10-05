@@ -98,7 +98,7 @@ static UINT next_buffer_id = 1;
 static UINT64 present_serial;
 static struct wsd_hello_reply hello;
 static BOOL cursor_visible = TRUE;
-static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','s','a','i','l','o','v','e','r','_','w','i','n','d','o','w',0};
+static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','o','b','e','l','i','s','k','_','w','i','n','d','o','w',0};
 static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
 static void (*presented_listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns );
 static BOOL debug_injected;
