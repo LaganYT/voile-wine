@@ -51,6 +51,7 @@ static struct {
    uint64_t presents;
    uint64_t first_present_ns;
    uint32_t in_flight;          /* PRESENT_REGION sent, EV_PRESENTED not yet received */
+   uint64_t latch_serial;       /* serial of the frame sent last, until wsd releases it (0: none) */
    /* statistics, logged every 300 presents (and the first one) */
    uint64_t stat_fence_timeouts, stat_fence_ns, stat_pace_ns, stat_last_ns, stat_interval_ns, stat_pace_timeouts, stat_no_fence;
    uint64_t stat_presented;     /* EV_PRESENTED received */
@@ -89,8 +90,12 @@ static bool bind_driver(void)
 /* called on the display driver's event thread */
 static void on_release(unsigned int buffer_id, unsigned int shown, uint64_t serial)
 {
-   (void)shown; (void)serial;
+   (void)shown;
    pthread_mutex_lock(&g_lock);
+   if (g_wsi.latch_serial && serial == g_wsi.latch_serial) {
+      g_wsi.latch_serial = 0;
+      pthread_cond_broadcast(&g_cond);
+   }
    for (uint32_t i = 0; g_wsi.active && i < g_wsi.num_images; i++) {
       if (g_wsi.buffer_ids[i] == buffer_id) {
          g_wsi.released[i]++;
@@ -192,20 +197,47 @@ NTSTATUS npt_do_wsi_init(void *args)
    return STATUS_SUCCESS;
 }
 
-/* Pacing (NPT_WSD_PACING): "after" (default) sends each frame as soon as its fence signals, then waits until wsd
- * has shown it (EV_PRESENTED, bounded by 100 ms) before returning, so the game is held to the display rate without a
- * ready frame waiting a whole refresh for its predecessor. "before" is the former behaviour (a ready frame waits for
- * the previous one to be shown, then is queued in wsd for the next refresh: one more frame of input latency).
- * "off" never waits (wsd keeps only the newest unshown frame). */
+/* Pacing (NPT_WSD_PACING): "latch" (default) sends each frame as soon as its fence signals, then waits until wsd
+ * has taken it at a display-link tick (EV_RELEASE of that frame: copied into a drawable, or replaced), bounded by
+ * 100 ms. The game is held to the display rate with one frame in the queue, while the macOS composition that follows
+ * (two or three refreshes) overlaps the next frames. "after" waits until wsd has shown the frame (EV_PRESENTED): the
+ * composition is then part of every frame, which caps a 120 Hz display at about 40 frames per second. "before" is the
+ * former behaviour (a ready frame waits for the previous one to be shown, then is queued in wsd for the next refresh:
+ * one more frame of input latency). "off" never waits (wsd keeps only the newest unshown frame). */
 static int pacing_mode(void)
 {
    static int mode = -1;
    if (mode < 0) {
       const char *e = getenv("NPT_WSD_PACING");
-      mode = !e ? 2 : !strcmp(e, "before") ? 1 : !strcmp(e, "off") ? 0 : 2;
-      fprintf(stderr, "neptune unixlib wsi (wsd): pacing %s\n", mode == 2 ? "after send" : mode == 1 ? "before send" : "off");
+      mode = !e ? 3 : !strcmp(e, "after") ? 2 : !strcmp(e, "before") ? 1 : !strcmp(e, "off") ? 0 : 3;
+      fprintf(stderr, "neptune unixlib wsi (wsd): pacing %s\n",
+              mode == 3 ? "latch" : mode == 2 ? "after send" : mode == 1 ? "before send" : "off");
    }
    return mode;
+}
+
+static void deadline_in_ms(struct timespec *deadline, long ms)
+{
+   clock_gettime(CLOCK_REALTIME, deadline);
+   deadline->tv_nsec += ms * 1000000;
+   if (deadline->tv_nsec >= 1000000000) { deadline->tv_sec++; deadline->tv_nsec -= 1000000000; }
+}
+
+/* "latch": until wsd releases the frame sent last */
+static void latch_wait(void)
+{
+   struct timespec deadline;
+   int timedout = 0;
+   uint64_t w0;
+   deadline_in_ms(&deadline, 100);
+   pthread_mutex_lock(&g_lock);
+   w0 = now_ns();
+   while (g_wsi.latch_serial && !timedout)
+      timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
+   if (timedout) g_wsi.stat_pace_timeouts++;
+   g_wsi.stat_pace_ns += now_ns() - w0;
+   g_wsi.latch_serial = 0;
+   pthread_mutex_unlock(&g_lock);
 }
 
 static void pace_wait(void)
@@ -276,10 +308,17 @@ NTSTATUS npt_do_wsi_present(void *args)
       pr = r.present;
       pthread_mutex_lock(&g_lock);
       g_wsi.in_flight++;
+      if (pacing_mode() == 3) g_wsi.latch_serial = r.present.serial;
       pthread_mutex_unlock(&g_lock);
-      if (!p_send(WSD_PRESENT_REGION, &r, sizeof(r), -1)) return STATUS_SUCCESS;
+      if (!p_send(WSD_PRESENT_REGION, &r, sizeof(r), -1)) {
+         pthread_mutex_lock(&g_lock);
+         g_wsi.latch_serial = 0;
+         pthread_mutex_unlock(&g_lock);
+         return STATUS_SUCCESS;
+      }
    }
-   if (pacing_mode() == 2) pace_wait();
+   if (pacing_mode() == 3) latch_wait();
+   else if (pacing_mode() == 2) pace_wait();
 
    if (!g_wsi.presents++) g_wsi.first_present_ns = pr.client_time_ns;
    if (g_wsi.stat_last_ns) g_wsi.stat_interval_ns += pr.client_time_ns - g_wsi.stat_last_ns;
