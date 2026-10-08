@@ -85,6 +85,7 @@ struct npt_unix_wsi_present_params {
    int result;
    int wait_fence_fd;
    uint32_t wait_fence_consumed;
+   uint32_t sync_interval;   /* the Present's SyncInterval: 0 asks for no vsync */
 };
 
 /*

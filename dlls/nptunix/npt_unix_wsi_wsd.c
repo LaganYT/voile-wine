@@ -197,23 +197,31 @@ NTSTATUS npt_do_wsi_init(void *args)
    return STATUS_SUCCESS;
 }
 
-/* Pacing (NPT_WSD_PACING): "latch" (default) sends each frame as soon as its fence signals, then waits until wsd
- * has taken it at a display-link tick (EV_RELEASE of that frame: copied into a drawable, or replaced), bounded by
- * 100 ms. The game is held to the display rate with one frame in the queue, while the macOS composition that follows
- * (two or three refreshes) overlaps the next frames. "after" waits until wsd has shown the frame (EV_PRESENTED): the
- * composition is then part of every frame, which caps a 120 Hz display at about 40 frames per second. "before" is the
- * former behaviour (a ready frame waits for the previous one to be shown, then is queued in wsd for the next refresh:
- * one more frame of input latency). "off" never waits (wsd keeps only the newest unshown frame). */
-static int pacing_mode(void)
+/* Pacing follows the game's vsync: a Present with a SyncInterval uses "latch", one without uses "off".
+ * "latch" sends each frame as soon as its fence signals, then waits until wsd has taken it at a display-link tick
+ * (EV_RELEASE of that frame: copied into a drawable, or replaced), bounded by 100 ms. The game is held to the display
+ * rate with one frame in the queue, while the macOS composition that follows (two or three refreshes) overlaps the
+ * next frames. "off" never waits: wsd keeps only the newest unshown frame, as no tearing is possible.
+ * NPT_WSD_PACING forces one mode for every frame: "latch", "off", "after" (waits until wsd has shown the frame,
+ * EV_PRESENTED: the composition is then part of every frame, which caps a 120 Hz display at about 30 frames per
+ * second) or "before" (a ready frame waits for the previous one to be shown, then is queued in wsd for the next
+ * refresh: one more frame of input latency). */
+static int forced_pacing_mode(void)
 {
-   static int mode = -1;
-   if (mode < 0) {
+   static int mode = -2;
+   if (mode == -2) {
       const char *e = getenv("NPT_WSD_PACING");
-      mode = !e ? 3 : !strcmp(e, "after") ? 2 : !strcmp(e, "before") ? 1 : !strcmp(e, "off") ? 0 : 3;
-      fprintf(stderr, "neptune unixlib wsi (wsd): pacing %s\n",
-              mode == 3 ? "latch" : mode == 2 ? "after send" : mode == 1 ? "before send" : "off");
+      mode = !e ? -1 : !strcmp(e, "latch") ? 3 : !strcmp(e, "after") ? 2 : !strcmp(e, "before") ? 1 : !strcmp(e, "off") ? 0 : -1;
+      fprintf(stderr, "neptune unixlib wsi (wsd): pacing %s\n", mode == 3 ? "latch" : mode == 2 ? "after send" :
+              mode == 1 ? "before send" : mode == 0 ? "off" : "from the game's vsync");
    }
    return mode;
+}
+
+static int pacing_mode(const struct npt_unix_wsi_present_params *p)
+{
+   int mode = forced_pacing_mode();
+   return mode >= 0 ? mode : p->sync_interval ? 3 : 0;
 }
 
 static void deadline_in_ms(struct timespec *deadline, long ms)
@@ -265,6 +273,7 @@ NTSTATUS npt_do_wsi_present(void *args)
    struct npt_unix_wsi_present_params *p = args;
    struct wsd_present pr;
    uint64_t t0 = now_ns();
+   int mode;
 
    p->result = -1;
    p->wait_fence_consumed = 0;
@@ -292,7 +301,8 @@ NTSTATUS npt_do_wsi_present(void *args)
       return STATUS_SUCCESS;
    }
 
-   if (pacing_mode() == 1) pace_wait();
+   mode = pacing_mode(p);
+   if (mode == 1) pace_wait();
 
    /* the swapchain covers the client area of the window (Wine draws the frame): present into an overlay plane */
    {
@@ -308,7 +318,7 @@ NTSTATUS npt_do_wsi_present(void *args)
       pr = r.present;
       pthread_mutex_lock(&g_lock);
       g_wsi.in_flight++;
-      if (pacing_mode() == 3) g_wsi.latch_serial = r.present.serial;
+      if (mode == 3) g_wsi.latch_serial = r.present.serial;
       pthread_mutex_unlock(&g_lock);
       if (!p_send(WSD_PRESENT_REGION, &r, sizeof(r), -1)) {
          pthread_mutex_lock(&g_lock);
@@ -317,8 +327,8 @@ NTSTATUS npt_do_wsi_present(void *args)
          return STATUS_SUCCESS;
       }
    }
-   if (pacing_mode() == 3) latch_wait();
-   else if (pacing_mode() == 2) pace_wait();
+   if (mode == 3) latch_wait();
+   else if (mode == 2) pace_wait();
 
    if (!g_wsi.presents++) g_wsi.first_present_ns = pr.client_time_ns;
    if (g_wsi.stat_last_ns) g_wsi.stat_interval_ns += pr.client_time_ns - g_wsi.stat_last_ns;
