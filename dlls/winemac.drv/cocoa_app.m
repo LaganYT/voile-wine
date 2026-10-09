@@ -43,6 +43,11 @@ static NSString* const WineActivatingAppPIDKey = @"ActivatingAppPID";
 static NSString* const WineActivatingAppPrefixKey = @"ActivatingAppPrefix";
 static NSString* const WineActivatingAppConfigDirKey = @"ActivatingAppConfigDir";
 
+// Obelisk opens its game overlay on Shift-Tab with a hot key, which never
+// fires while we have the displays captured: we get the key instead, and
+// tell Obelisk of it.
+static NSString* const ObeliskOverlayKeyNotification = @"com.zagrios.obelisk.overlayKey";
+
 /* CW Hack 22310, 24199 */
 // WineExternalQuitRequestNotification is sent on the distributed notification center when an app
 // may need to quit in response to another app quitting via Cocoa. Any app in the same prefix with a
@@ -1207,6 +1212,27 @@ static NSString* WineLocalizedString(unsigned int stringID)
         self.applicationIcon = nsimage;
     }
 
+    // Gives the displays back, at their desktop modes. The game's modes are
+    // latent: becoming active again sets them and captures the displays.
+    - (void) releaseDisplaysUntilActive
+    {
+        if ([originalDisplayModes count] || displaysCapturedForFullscreen)
+        {
+            NSNumber* displayID;
+            for (displayID in originalDisplayModes)
+            {
+                CGDisplayModeRef mode = CGDisplayCopyDisplayMode([displayID unsignedIntValue]);
+                [latentDisplayModes setObject:(id)mode forKey:displayID];
+                CGDisplayModeRelease(mode);
+            }
+
+            CGRestorePermanentDisplayConfiguration();
+            CGReleaseAllDisplays();
+            [originalDisplayModes removeAllObjects];
+            displaysCapturedForFullscreen = FALSE;
+        }
+    }
+
     - (void) handleCommandTab
     {
         if ([NSApp isActive])
@@ -1215,21 +1241,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             NSRunningApplication* app;
             NSRunningApplication* otherValidApp = nil;
 
-            if ([originalDisplayModes count] || displaysCapturedForFullscreen)
-            {
-                NSNumber* displayID;
-                for (displayID in originalDisplayModes)
-                {
-                    CGDisplayModeRef mode = CGDisplayCopyDisplayMode([displayID unsignedIntValue]);
-                    [latentDisplayModes setObject:(id)mode forKey:displayID];
-                    CGDisplayModeRelease(mode);
-                }
-
-                CGRestorePermanentDisplayConfiguration();
-                CGReleaseAllDisplays();
-                [originalDisplayModes removeAllObjects];
-                displaysCapturedForFullscreen = FALSE;
-            }
+            [self releaseDisplaysUntilActive];
 
             for (app in [[NSWorkspace sharedWorkspace] runningApplications])
             {
@@ -1929,6 +1941,22 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 [anEvent.window sendEvent:anEvent];
                 ret = TRUE;
             }
+            else if (anEvent.keyCode == kVK_Tab && [self areDisplaysCaptured] &&
+                     (anEvent.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask &
+                      (NSEventModifierFlagShift | NSEventModifierFlagControl |
+                       NSEventModifierFlagOption | NSEventModifierFlagCommand)) == NSEventModifierFlagShift)
+            {
+                if (!anEvent.isARepeat)
+                {
+                    [self releaseDisplaysUntilActive];
+                    [[NSDistributedNotificationCenter defaultCenter]
+                        postNotificationName:ObeliskOverlayKeyNotification
+                                      object:nil
+                                    userInfo:@{ @"pid": @([[NSProcessInfo processInfo] processIdentifier]) }
+                          deliverImmediately:YES];
+                }
+                ret = TRUE;
+            }
         }
         else if (type == NSEventTypeKeyUp)
         {
@@ -2499,6 +2527,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
 
         [self releaseMouseCapture];
+
+        // Another app shows over our fullscreen windows, such as Obelisk's
+        // game overlay: it can only while the displays are free.
+        if (!temporarilyIgnoreResignEventsForDialog)
+            [self releaseDisplaysUntilActive];
     }
 
     - (void) applicationDidUnhide:(NSNotification*)aNotification
