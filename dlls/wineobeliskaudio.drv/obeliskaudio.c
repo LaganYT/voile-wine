@@ -909,6 +909,11 @@ static NTSTATUS obelisk_release_render_buffer(void *args)
     stream->written_frames += written_frames;
     stream->getbuf_last = 0;
 
+    /* Hand the frames to wsd now, not at the next timer tick: until then the ring held about one period less than
+     * the client had written, and wsd ran short several times a second (crackles). */
+    if(stream->playing)
+        obelisk_write_data(stream);
+
     return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
