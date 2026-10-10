@@ -3078,6 +3078,13 @@ void signal_init_process(void)
 }
 
 
+#ifdef __linux__
+void set_thread_teb( TEB *teb )
+{
+    arch_prctl( ARCH_SET_GS, teb );
+}
+#endif
+
 /***********************************************************************
  *           init_syscall_frame
  */
