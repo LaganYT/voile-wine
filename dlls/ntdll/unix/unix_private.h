@@ -260,6 +260,13 @@ static inline void set_context_exception_reporting_flags( DWORD *context_flags, 
 extern unsigned int xstate_get_size( UINT64 compaction_mask, UINT64 mask );
 extern void copy_xstate( XSAVE_AREA_HEADER *dst, XSAVE_AREA_HEADER *src, UINT64 mask );
 
+/* The x86-64 syscall stubs of include/wine/asm.h call through a pointer at this offset from user_shared_data
+ * (7ffe4000). It used to be the page right after KUSER_SHARED_DATA (7ffe1000); that page is MAP_SHARED with the
+ * wineserver while the pointer page is private and writable, and hosts with pages larger than 4 KiB cannot protect
+ * them differently inside one host page. The offset is therefore a multiple of the largest host page size (16 KiB)
+ * and lies inside the 64 KiB block that virtual_alloc_first_teb() reserves at user_shared_data. */
+#define USD_SYSCALL_DISPATCHER_OFFSET 0x4000
+
 extern void set_process_instrumentation_callback( void *callback );
 
 extern void *get_cpu_area( USHORT machine );

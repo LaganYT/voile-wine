@@ -4086,9 +4086,9 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T total = 32 * block_size;
 
     /* Reserve the whole 64 KiB allocation granularity block of the shared user data, like Windows does, and commit
-     * only its first page. The page is later remapped MAP_SHARED, and no other allocation may share a host page
-     * with it (Obelisk: hosts whose pages are larger than 4 KiB cannot give a shared page and a private one
-     * different protections). */
+     * its first page (and on x86-64 the syscall dispatcher page). The first page is later remapped MAP_SHARED, and
+     * no other allocation may share a host page with it (Obelisk: hosts whose pages are larger than 4 KiB cannot
+     * give a shared page and a private one different protections). */
     {
         void *usd_base = user_shared_data;
         SIZE_T usd_size = 0x10000;
@@ -4098,6 +4098,20 @@ TEB *virtual_alloc_first_teb(void)
         if (!status)
             status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                               MEM_COMMIT, PAGE_READONLY );
+#ifdef __x86_64__
+        /* Obelisk: commit the syscall dispatcher page too, read-write for signal_init_process() and
+         * set_process_instrumentation_callback(). Left reserved, its protection byte said PAGE_NOACCESS, and the
+         * first mprotect_range() over this view (virtual_set_force_exec() when a 32-bit module lacks NX_COMPAT)
+         * made it PROT_NONE under every 64-bit syscall stub. */
+        if (!status)
+        {
+            void *dispatcher_page = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
+            SIZE_T dispatcher_size = page_size;
+
+            status = NtAllocateVirtualMemory( NtCurrentProcess(), &dispatcher_page, 0, &dispatcher_size,
+                                              MEM_COMMIT, PAGE_READWRITE );
+        }
+#endif
     }
     if (status)
     {
