@@ -386,13 +386,24 @@ void prepend_dll_path(const char *path)
 
 static void set_dll_path(void)
 {
-    char *p, *path = getenv( "WINEDLLPATH" );
+    char *p, *path = getenv( "WINEDLLPATH" ), *first = getenv( "WINEDLLPATH_PREPEND" );
     int i, count = 0;
 
     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
+    if (first) for (p = first, count++; *p; p++) if (*p == ':') count++;
 
     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
     count = 0;
+
+    /* Obelisk: the folders of the graphics backend a game runs with, such as
+     * D3DMetal's or DXMT's, come before Wine's own, so that their builtin
+     * d3d11 and dxgi replace Wine's. */
+    if (first)
+    {
+        first = strdup( first );
+        for (p = strtok( first, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
+        free( first );
+    }
 
     if (!build_dir) dll_paths[count++] = dll_dir;
 
