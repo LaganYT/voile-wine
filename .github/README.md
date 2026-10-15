@@ -24,7 +24,7 @@ Each change is one commit on `main`; `git log crossover..main` lists them. Sever
 | **Gamepads** | `winebus.sys` serves the gamepads of Obelisk's input service (`bus_obelisk.c`), in both Wines. XInput and Windows.Gaming.Input keep controllers across hotplug and report them from startup. |
 | **Games** | Fixes for fullscreen windows, keyboard state, audio mixing, the Visual C++ runtime version, crash dialogs and memory allocation, among others. |
 | **Prefixes** | User folders stay inside the prefix instead of linking to the Mac home, and the registry is saved outside the wineserver. |
-| **macOS** | `winemac.drv` tells Obelisk of Shift-Tab while a game has captured the displays, so its in-game overlay still opens. |
+| **macOS** | `winemac.drv` tells Obelisk of Shift-Tab while a game has captured the displays, so its in-game overlay still opens. ntdll searches the folders in `WINEDLLPATH_PREPEND` before its own, so that the graphics backend a game runs with, D3DMetal or DXMT, replaces Wine's `d3d11` and `dxgi`. |
 | **Build** | Modules such as `lsteamclient` build outside Wine's tree, `win32u` builds without Vulkan, and ntdll no longer loads CrossOver's compatibility database, which Voile does not ship. |
 
 ## Branches
