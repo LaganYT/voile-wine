@@ -100,7 +100,18 @@ static USHORT fs32_sel;  /* selector for %fs in 32-bit mode */
 #ifdef linux
 
 #include <asm/prctl.h>
+#include <sys/prctl.h>
 static inline int arch_prctl( int func, void *ptr ) { return syscall( __NR_arch_prctl, func, ptr ); }
+
+#ifndef PR_SET_SYSCALL_USER_DISPATCH
+# define PR_SET_SYSCALL_USER_DISPATCH 59
+# define PR_SYS_DISPATCH_ON 1
+#endif
+/* Native code, which may make Linux syscalls: GE-Proton's range. Protected programs map Windows code just
+ * above 0x700000000000 (Marvel Rivals up to 0x7000005d442f, HELLDIVERS 2's runtime.dll up to 0x700003df0000),
+ * so the range starts 4 GiB higher; Easy Anti-Cheat maps its Linux module at 0x700100000000. */
+#define NATIVE_SYSCALL_ADDRESS_START   0x700100000000ull
+#define TOP_DOWN_SYSCALL_ADDRESS_START 0x7ffffe000000ull
 
 extern int alloc_fs_sel( int sel, void *base );
 __ASM_GLOBAL_FUNC( alloc_fs_sel,
@@ -2824,12 +2835,15 @@ __ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
                    "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
                    "popq %rcx\n\t"
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
+#endif
 
+#if defined(__APPLE__) || defined(__linux__)
 /**********************************************************************
  *		sigsys_handler
  *
  * Handler for SIGSYS, signals that a non-existent system call was invoked.
- * Only called on macOS 14 Sonoma and later.
+ * Called on macOS 14 Sonoma and later, and on Linux for the syscall
+ * instructions of Windows code (see init_syscall_frame).
  */
 static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
@@ -2839,7 +2853,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
     TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
 
-    frame->rip = RIP_sig(ucontext) + 0xb;
+    frame->rip = RIP_sig(ucontext) + 0xb;  /* the dispatcher takes 0xb off: resume after the syscall */
     frame->rcx = RIP_sig(ucontext);
     frame->eflags = EFL_sig(ucontext);
     frame->restore_flags = 0;
@@ -2853,6 +2867,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     }
     RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
 
+#ifdef __APPLE__
     /* CW Hack 24265 */
     if (is_rosetta2 && FPU_sig(ucontext))
     {
@@ -2873,6 +2888,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             RIP_sig(ucontext) = (ULONG64)__restore_mxcsr_thunk;
         }
     }
+#endif
 }
 #endif
 
@@ -3059,7 +3075,7 @@ void signal_init_process(void)
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     sig_act.sa_sigaction = sigsys_handler;
     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
 #endif
@@ -3099,6 +3115,11 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
         alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
     }
+    /* A syscall instruction outside the native range raises SIGSYS (sigsys_handler) instead of reaching
+     * Linux: some protections make direct syscalls from Windows code and refuse a Wine without that
+     * emulation (HELLDIVERS 2). Per thread: clone does not pass it on. */
+    prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, NATIVE_SYSCALL_ADDRESS_START,
+           TOP_DOWN_SYSCALL_ADDRESS_START - NATIVE_SYSCALL_ADDRESS_START, 0 );
 #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
     amd64_set_gsbase( teb );
 #elif defined(__NetBSD__)
