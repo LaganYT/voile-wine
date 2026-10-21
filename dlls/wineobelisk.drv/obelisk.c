@@ -105,6 +105,7 @@ static BOOL debug_injected;
 static BOOL wsd_send( UINT type, const void *payload, UINT len, const void *extra, UINT extra_len, int fd );
 static UINT relative_window;  /* wsd window in relative mouse mode, 0 when none */
 static BOOL clip_active;
+static float relative_rest_x, relative_rest_y;  /* fractions of a pixel not sent yet */
 
 /* Relative (raw delta) mouse while the game hides the cursor and confines it to its window, like a captured mouse
  * on Windows; absolute otherwise. */
@@ -645,13 +646,14 @@ static BOOL OBELISK_ClipCursor( const RECT *clip, BOOL reset )
         rc.top = max( clip->top, win->visible.top );
         rc.right = min( clip->right, win->visible.right );
         rc.bottom = min( clip->bottom, win->visible.bottom );
-        if (rc.left < rc.right && rc.top < rc.bottom)
+        /* an empty rectangle holds the cursor on one point, as Unity's locked cursor at the window's center */
+        if (rc.left <= rc.right && rc.top <= rc.bottom && rc.left < win->visible.right && rc.top < win->visible.bottom)
         {
             req.enable = 1;
             req.x = rc.left - win->visible.left;
             req.y = rc.top - win->visible.top;
-            req.width = rc.right - rc.left;
-            req.height = rc.bottom - rc.top;
+            req.width = max( rc.right - rc.left, 1 );
+            req.height = max( rc.bottom - rc.top, 1 );
         }
     }
     pthread_mutex_unlock( &win_lock );
@@ -821,7 +823,15 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     case WSD_EV_RELATIVE:
     {
         const struct wsd_ev_relative *ev = (const void *)payload;
-        if (hwnd) send_mouse( hwnd, MOUSEEVENTF_MOVE, (int)ev->dx, (int)ev->dy, 0 );
+        int dx, dy;
+        if (!hwnd) break;
+        relative_rest_x += ev->dx;
+        relative_rest_y += ev->dy;
+        dx = (int)relative_rest_x;
+        dy = (int)relative_rest_y;
+        relative_rest_x -= dx;
+        relative_rest_y -= dy;
+        if (dx || dy) send_mouse( hwnd, MOUSEEVENTF_MOVE, dx, dy, 0 );
         break;
     }
     case WSD_EV_BUTTON:
@@ -840,8 +850,10 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         }
         if (!flags) break;
         if (!ev->down) flags <<= 1;
-        send_mouse( hwnd, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    visible.left + (int)ev->x, visible.top + (int)ev->y, 0 );
+        /* in relative mode the Mac pointer stands still where the game's cursor is not */
+        if (relative_window != ev->window_id)
+            send_mouse( hwnd, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                        visible.left + (int)ev->x, visible.top + (int)ev->y, 0 );
         send_mouse( hwnd, flags, 0, 0, data );
         break;
     }
