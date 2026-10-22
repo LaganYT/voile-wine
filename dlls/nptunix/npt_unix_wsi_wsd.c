@@ -124,7 +124,8 @@ static uint32_t wsd_format(uint32_t virgl_format)
 {
    switch (virgl_format) {
    case 67: return WSD_FMT_RGBA8;    /* R8G8B8A8_UNORM */
-   case 1:                           /* B8G8R8A8_UNORM */
+   case 8: return WSD_FMT_RGB10A2;   /* R10G10B10A2_UNORM */
+   case 1:                          /* B8G8R8A8_UNORM */
    case 2:                           /* B8G8R8X8_UNORM: wsd presents opaque */
    default: return WSD_FMT_BGRA8;
    }

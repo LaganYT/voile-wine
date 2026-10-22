@@ -66,7 +66,7 @@ enum {
   WSD_EV_ERROR = 113,      /* wsd_ev_error */
 };
 
-enum { WSD_FMT_BGRA8 = 1, WSD_FMT_RGBA8 = 2 };
+enum { WSD_FMT_BGRA8 = 1, WSD_FMT_RGBA8 = 2, WSD_FMT_RGB10A2 = 3 };
 
 enum {
   WSD_STYLE_TITLED = 1u << 0,
