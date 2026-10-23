@@ -90,7 +90,7 @@ struct obelisk_win
 };
 
 /* driver messages, handled by OBELISK_WindowMessage in the window's thread */
-enum { WM_OBELISK_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG };
+enum { WM_OBELISK_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG, WM_OBELISK_TAKE_FOCUS };
 
 static int wsd_fd = -1;
 static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -470,9 +470,10 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
     {
         if (!visible || !(win = alloc_win( hwnd ))) goto done;
     }
-    if (minimized && win->created && win->shown && (win->style & WSD_STYLE_MINIATURIZABLE))
+    if (minimized && win->created && win->shown)
     {
-        /* into the Dock; Wine's minimized position (off screen) is not given to wsd */
+        /* into the Dock, or out of sight for a window without a minimize button, which wsd brings back when the user
+         * comes back to the game; Wine's minimized position (off screen) is not given to wsd */
         if (!win->minimized)
             wsd_send( WSD_WINDOW_MINIMIZE, &(struct wsd_window_flag){ win_id( win ), 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
         win->minimized = TRUE;
@@ -589,6 +590,15 @@ static LRESULT OBELISK_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     case WM_OBELISK_APPLY_FRAME:
         apply_frame( hwnd );
         return 0;
+    case WM_OBELISK_TAKE_FOCUS:
+    {
+        /* The user made it the Mac's key window: it takes the foreground whatever process has it (Wine's foreground
+         * lock refused the event thread once the desktop had it), as winemac.drv's macdrv_window_got_focus gives it,
+         * in the window's thread. A window still minimized waits for the restore posted before this message. */
+        DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+        if ((style & WS_VISIBLE) && !(style & (WS_DISABLED | WS_MINIMIZE))) NtUserSetForegroundWindowInternal( hwnd );
+        return 0;
+    }
     }
     FIXME( "unknown driver message %#x hwnd %p\n", msg, hwnd );
     return 0;
@@ -1141,7 +1151,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_window_flag *ev = (const void *)payload;
         TRACE( "focus %u hwnd %p\n", ev->value, hwnd );
-        if (hwnd && ev->value) NtUserSetForegroundWindow( hwnd );
+        if (hwnd && ev->value) NtUserPostMessage( hwnd, WM_OBELISK_TAKE_FOCUS, 0, 0 );
         break;
     }
     case WSD_EV_CLOSE:
@@ -1175,6 +1185,8 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         pthread_mutex_unlock( &win_lock );
         TRACE( "hwnd %p minimized %u by the user (changed %u)\n", hwnd, ev->value, changed );
         if (hwnd && changed) NtUserPostMessage( hwnd, WM_SYSCOMMAND, ev->value ? SC_MINIMIZE : SC_RESTORE, 0 );
+        /* restored by the user, as from the taskbar on Windows: the window takes the focus once restored */
+        if (hwnd && changed && !ev->value) NtUserPostMessage( hwnd, WM_OBELISK_TAKE_FOCUS, 0, 0 );
         break;
     }
     case WSD_EV_ZOOM:
@@ -1188,6 +1200,19 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_ev_resize *ev = (const void *)payload;
         TRACE( "hwnd %p resized to %ux%u\n", hwnd, ev->width_px, ev->height_px );
+        break;
+    }
+    case WSD_EV_APP_DEACTIVATED:
+    {
+        HWND foreground = NtUserGetForegroundWindow();
+        DWORD pid = 0;
+        /* Another Mac app is in front: the game goes to the background as winemac.drv sends it there
+         * (macdrv_app_deactivated), the desktop taking the foreground, and gets WM_ACTIVATEAPP. The process that has
+         * the foreground does it. */
+        if (!foreground || !NtUserGetWindowThread( foreground, &pid ) || pid != GetCurrentProcessId()) break;
+        TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
+        NtUserClipCursor( NULL );
+        NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
         break;
     }
     case WSD_EV_DISPLAY:
